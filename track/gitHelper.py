@@ -1,6 +1,7 @@
 from pydriller import Repository
-from git import Repo
-from typing import Optional, Dict, Tuple
+from pydriller.domain.commit import Commit as pydrillerCommit
+from git import Repo, Commit
+from typing import Optional, Tuple, Dict, List, Union
 
 class GitRepoHelper:
     def __init__(self, repo_path:str, order:Optional[str]=None, only_no_merge:bool=False): 
@@ -42,15 +43,16 @@ class GitRepoHelper:
         return False
          
     @staticmethod
-    def get_file_content(commit, file_path, encoding: Optional[str] = None) -> Optional[Tuple[str, str]]:
+    def get_file_content(commit:Commit, file_path, encoding: Optional[str] = None) -> Optional[Tuple[str, str]]:
         try:
             blob = commit.tree / file_path
+            raw = blob.data_stream.read()
             # new
             encodings_to_try = ['utf-8', 'cp1252', 'latin1'] if encoding is None else [encoding]
             out, enc_used = None, None
             for enc in encodings_to_try:
                 try:
-                    out = blob.data_stream.read().decode(encoding=enc)
+                    out = raw.decode(encoding=enc)
                     enc_used = enc
                     break
                 except UnicodeDecodeError as e:
@@ -59,9 +61,20 @@ class GitRepoHelper:
             if out is None: 
                 # Final fallback: read as bytes and decode as UTF-8 (ignoring errors)
                 enc_used = 'utf-8'
-                out = blob.data_stream.read().decode(encoding=enc_used, erros='ignore')
+                out = raw.decode(encoding=enc_used, erros='ignore')
             return out, enc_used
         except Exception as e:
             print (f"While working with {file_path}")
             print (e)
             return None
+        
+    @staticmethod
+    def parse_commit(commit:pydrillerCommit) -> Dict[str, Union[str,List[str]]]:
+        author_email:str = commit.author.email
+        author_name:str = commit.author.name
+        msg:str = commit.msg 
+        author_date = str(commit.author_date)
+        modified_fpaths:List[str] = list(map(lambda v:v.new_path, commit.modified_files)) # path at this commit
+        return {'author_email':author_email, 'author_name':author_name, 'msg':msg, 'author_date':author_date, 'modified_fpaths':modified_fpaths}
+        
+     

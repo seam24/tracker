@@ -121,7 +121,7 @@ def analyse_mth_changes(
             other_start_lno, other_end_lno = None, None
         
         # map chr to line 
-        start_lno = chr_to_line_src[pos] 
+        start_lno = chr_to_line_src[pos]
         end_lno = chr_to_line_src[pos + length]
 
         # get label 
@@ -129,7 +129,7 @@ def analyse_mth_changes(
         
         updated_mth_range[f"{start_lno}-{end_lno}"] = {
             'start_pos':other_pos, 
-            'end_pos':other_pos + length if other_pos is not None else None, 
+            'end_pos':other_pos + other_length if other_pos is not None else None, 
             'start_lno':other_start_lno, 
             'end_lno':other_end_lno, 
             'label':label}

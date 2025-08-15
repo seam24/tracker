@@ -9,13 +9,15 @@ from typing import List, Dict, Tuple, Set, Optional
 from track.gitHelper import GitRepoHelper
 from utils import gumtreeUtils
 from track.node import TMethod 
+from track.changes import Change
 from utils.fileUtils import save_content, get_content
 import traceback 
 import pickle 
 
 GUMTREE_IMAGE = None
 GUMTREE_PLATFORM = None 
-INTERMEDIATE_RESULTFILE = os.path.join('results', "inter_results.pkl")
+INTERMEDIATE_RESULTFILE = "{0}/inter_results.pkl"
+OUTPUT_DIR = None
 
 def init(
     rpHelper:GitRepoHelper, 
@@ -24,10 +26,21 @@ def init(
     file_types:Optional[List[str]] = None,
     target_types:Optional[List[str]] = None, 
 ) -> Dict[str, Dict[str, TMethod]]:
+    """_summary_
+
+    Args:
+        rpHelper (GitRepoHelper): _description_
+        intermediate_dir (str): _description_
+        target_files (Optional[List[str]], optional): _description_. Defaults to None.
+        file_types (Optional[List[str]], optional): _description_. Defaults to None.
+        target_types (Optional[List[str]], optional): _description_. Defaults to None.
+
+    Returns:
+        Dict[str, Dict[str, TMethod]]: _description_
+    """
     def clean(temp_fpath:str):
         if os.path.exists(temp_fpath):
-            os.unlink(temp_fpath)
-            
+            os.unlink(temp_fpath)     
     # target_files: 
     #   - both source and test files should be tracked
     tracked_files = []
@@ -50,12 +63,8 @@ def init(
         temp_fpath = os.path.join(intermediate_dir, os.path.basename(target_file))
         write_status = rpHelper.write_file_to_disk(rpHelper.head_commit, target_file, temp_fpath)#, encoding='utf-8')
         if not write_status:
-            #print (f"Failed to retrieve and save the content of {target_file} in {temp_fpath}")
             raise Exception(f"Failed to retrieve and save the content of {target_file} in {temp_fpath}")
     
-        # sucessfully saved the content 
-        # - next, parse the content     
-        # need to init
         mth_declrs = gumtreeUtils.parse(
             GUMTREE_IMAGE, 
             temp_fpath, 
@@ -64,7 +73,6 @@ def init(
             container_path="/data", 
             target_types = target_types,
         )
-        #print ("mth dec", mth_declrs)
         if mth_declrs:
             for idx, mth_declr in enumerate(mth_declrs):
                 pos = int(mth_declr.get('pos'))
@@ -79,7 +87,6 @@ def init(
                     label = label,
                     local_file_path = temp_fpath 
                 )
-                #methods_by_file[target_file][mth_node.lno_key] = mth_node 
                 methods_by_file[target_file][idx] = mth_node
                 # clean up 
             clean(temp_fpath) 
@@ -88,12 +95,6 @@ def init(
         else:
             raise Exception(f"[Error] Failed to initialise method declarations in {target_file}") 
     return methods_by_file
-
-
-def analyse_changes(content_bfr:str, content_aft):
-    #from utils.gumtreeUtils import 
-    pass 
-
 
 def save_init_methods(methods_by_file:Dict[str, Dict[str, TMethod]], init_file:str):
     """_summary_
@@ -139,8 +140,10 @@ def update_files_to_track(initial_to_latest:Dict[str, str], latest_to_initial:Di
     updated_fpaths = []
     for afpath, bfpath in to_update.items():
         if afpath != bfpath:
-            old_path = latest_to_initial[afpath]
-            initial_to_latest[old_path] = bfpath # can contain None
+            init_path = latest_to_initial[afpath]
+            initial_to_latest[init_path] = bfpath # can contain None
+            del latest_to_initial[afpath]
+            latest_to_initial[bfpath] = init_path
             files_to_track.remove(afpath)
             if bfpath is not None:
                 files_to_track.add(bfpath)
@@ -184,7 +187,31 @@ def get_tracking_keys(methods_by_file: Dict[str, Dict[str, TMethod]]) -> Tuple[D
             mth_latest_lnokey_to_uid[fpath][lno_key] = uid
     return (initial_to_latest, latest_to_initial, mth_uid_to_latest_lnokey, mth_latest_lnokey_to_uid)
     
-    
+def save_inter_result(
+    methods_by_file:Dict[str, Dict[str, TMethod]], 
+    files_to_track:Set[str], 
+    initial_to_latest:Dict[str, Optional[str]], 
+    latest_to_initial:Dict[str, Optional[str]], 
+    mth_uid_to_latest_lnokey:Dict[str, Dict[str, Optional[str]]], 
+    mth_latest_lnokey_to_uid:Dict[str, Dict[str, Optional[str]]], 
+    curr_processed_modfiles:Set[str], 
+    last_commit_idx:int
+    ):
+    with open(INTERMEDIATE_RESULTFILE, 'wb') as f:
+        pickle.dump(
+            {'output':methods_by_file, 
+                'index':{
+                    'initial_to_latest': initial_to_latest, 
+                    'latest_to_initial': latest_to_initial,
+                    'mth_uid_to_latest_lnokey': mth_uid_to_latest_lnokey, 
+                    'mth_latest_lnokey_to_uid': mth_latest_lnokey_to_uid
+                    }, 
+                'files_to_track':files_to_track, 
+                'curr_processed_modfiles': curr_processed_modfiles,
+                'last_commit_idx':last_commit_idx
+            }, f) 
+
+
 def run(
     repo_path:str, 
     host_path:str, 
@@ -205,7 +232,7 @@ def run(
     Returns:
         Dict[str, Dict[str, TMethod]]: _description_
     """
-    global GUMTREE_PLATFORM, GUMTREE_IMAGE
+    global GUMTREE_PLATFORM, GUMTREE_IMAGE, INTERMEDIATE_RESULTFILE, OUTPUT_DIR
     from tqdm import tqdm
     from pathlib import Path
     
@@ -238,17 +265,16 @@ def run(
         save_init_methods(methods_by_file, init_file)
     initial_to_latest, latest_to_initial, mth_uid_to_latest_lnokey, mth_latest_lnokey_to_uid = get_tracking_keys(methods_by_file)
     files_to_track = set(list(methods_by_file.keys()))
-
     time_window = time_window * (60*60*24) # in seconds 
     start_time = None
     # initialisation and then start from the "initialised" commit
     # since we are doing in reverse, if the commit is the last one, we should go back once 
     commits = list(rpHelper.pydriller_repo.traverse_commits())
     print (f"[Start] Traversal starts from {commits[0].hash}")
-    # temporary 
     if os.path.exists(INTERMEDIATE_RESULTFILE): 
         with open(INTERMEDIATE_RESULTFILE, 'rb') as f:
             inter_results = pickle.load(f)
+
         methods_by_file = inter_results['output']
         initial_to_latest = inter_results['index']['initial_to_latest']
         latest_to_initial = inter_results['index']['latest_to_initial']
@@ -270,11 +296,12 @@ def run(
     
     already_processed = curr_processed_modfiles
     curr_processed_modfiles = set()
-    # temporary end
+    # chnage init start
+    changes_pcommit = {}
+    # change init end
     try:
         for i, commit in enumerate(tqdm(commits)):
             print (f"At commit: {commit.hash}")
-            
             last_commit_idx = i + delta # temp 
             curr_processed_modfiles = set() # re-init # temp 
             
@@ -287,48 +314,39 @@ def run(
             if time_difference > time_window:
                 print (f"[Out-of-time-window] {round(time_difference/(60*60*24),2)} > {time_window}. Stop tracking at {commit.hash}")
                 break
-
-            if commit.hash in 'b168f29106d112da0bbdb3a070be30f9ee3cb36e': 
-                for modified_file in commit.modified_files:
-                    print (modified_file.filename)
-                    print ("src", modified_file.new_path)
-                    print ("dst", modified_file.old_path)
-                    print (modified_file.change_type)
-                    print ()
-
-                    with open(INTERMEDIATE_RESULTFILE, 'wb') as f:
-                        pickle.dump(
-                            {'output':methods_by_file, 
-                             'index':{
-                                 'initial_to_latest': initial_to_latest, 
-                                 'latest_to_initial': latest_to_initial,
-                                 'mth_uid_to_latest_lnokey': mth_uid_to_latest_lnokey, 
-                                 'mth_latest_lnokey_to_uid': mth_latest_lnokey_to_uid
-                                 }, 
-                             'files_to_track':files_to_track, 
-                             'curr_processed_modfiles': curr_processed_modfiles,
-                             'last_commit_idx':last_commit_idx
-                            }, f) 
-                sys.exit()    
             
+            # set change start
+            parsed_info = GitRepoHelper.parse_commit(commit)
+            chg_inst = Change(
+                commit.hash, 
+                author=parsed_info['author_name'], 
+                author_email=parsed_info['author_email'], 
+                author_date=parsed_info['author_date'], 
+                msg = parsed_info['msg'], 
+                modified_fpaths=parsed_info['modified_fpaths']
+            )
+            # setchange set end 
             fpath_to_update:Dict[str, str] = {} # afpath(src) : bfpath(dst)
             for modified_file in commit.modified_files:
-                ## INTER 
+                # skip those alreaady processed (while continuing with inter) 
                 if i == 0:
                     if modified_file.filename in already_processed: # usage of filenmae is temp
                         continue # skip as it already has been handled
-                    
+                ## inter end
+                
                 src_path = modified_file.new_path
                 dst_path = modified_file.old_path
-                if not modified_file.filename.endswith(".java") or src_path not in files_to_track: # order matter
+                #if src_path not in files_to_track or not src_path.endswith(".java"): # here, the order matter
+                if not modified_file.filename.endswith(".java") or src_path not in files_to_track: 
                     continue
+                #print (modified_file.new_path not in list(methods_by_file.keys()))
                 # prepare the update for later 
                 fpath_to_update[src_path] = dst_path
                 # check whether we need to further process this file's changes (already did if dst_path is None) 
                 if dst_path is None: 
                     # the file no longer exist in the past, meaning the current commit is the commit where the file is first introduced 
-                    print (f"[Newly Introduced] A {modified_file} is introduced at {commit.hash}")
-                    print (f"                   End the tracking for {modified_file}")
+                    print (f"[Newly Introduced] A {src_path} is introduced at {commit.hash}")
+                    print (f"                   End the tracking for {src_path}")
                     continue
                 
                 # We need to get the file as "as-is" instead of decoded string to match with the outputs provided by gumtree
@@ -355,20 +373,17 @@ def run(
                     platform=GUMTREE_PLATFORM, 
                     host_path=str(host_path),
                     container_path=container_path
-                ) # ... -> should it be changed to .. new-key to old-key? but at the same time .. we need to consider that we are visiting the commits in "reverse"     order. so, "start_lno-end_lno" -> so .. the (new) start_lno ane end_lno retried here is acutaly those of before
-                # meaning that .. for gumtree-diff, we need to make sure that we are comparing in reverse older (or not...? need to thingk)
-                # now thinking .. we are doing in reverse, and start_lno and end_lno is from that commit, and the info will be udpated, so, mdofied or not can be simply    cheked aby start_lno and end_lno of pydriller 
+                ) 
                 # old_path: not in the current commit (the previosu commit) 
                 # new_path: in the current commit (and thereby, Method.start_lno and Method.end_lno are from the file of the curretn commit, and thereby form "new")
-                # if we do gumtree to be comparing backward: gumtreee {new_path} {old_path} (from the lastest to old), then "other_pos" will be about {old_path}
-                # updating 
                 fpath_key = latest_to_initial[src_path]
                 methods_to_check = methods_by_file[fpath_key]
-
+                
                 # tmth_diff_range is for updated method, and mth_lno_key is before the updated
                 # Get a list of modified methods 
                 modified_mths = modified_file.changed_methods
-                end_lno_of_modified_mths = set([mth.end_line for mth in modified_mths]) #
+                #end_lno_of_modified_mths = set([mth.end_line for mth in modified_mths]) #
+                end_lno_of_modified_mths = {mth.end_line:mth.long_name for mth in modified_mths}
                 for mth_lno_key, tmth_diff_range in updated_mth_range.items(): 
                     ####mth_at_last_mod = mth.long_name # from the src commit (not dst)
                     # update for the next parsing
@@ -396,10 +411,18 @@ def run(
                         else:
                             print (f"[Log] Failure on mapping at {commit.hash}: {fpath_key} representing {src_path} is missing")
                         continue
-                        
-                    tmth_node = methods_to_check[mth_uid]
+                    
+                    # Start updating
+                    tmth_node = methods_to_check[mth_uid]   
+                    # set mth change before updating 
+                    has_mth_modified = tmth_node.end_lno in end_lno_of_modified_mths
+                    if has_mth_modified:
+                        mth_raw_str_diff = Change.get_diff(tmth_node.content, next_content, reverse=True)
+                        chg_inst.set_mth_diff(src_path, end_lno_of_modified_mths[tmth_node.end_lno], mth_raw_str_diff)
+                    # end 
+                    
                     tmth_node.update(
-                        commit_hash=commit.hash if tmth_node.end_lno in end_lno_of_modified_mths else None,  # THIS SHOULD BE ONLY FOR THOSE MODIFIED METHODS
+                        commit_hash=commit.hash if has_mth_modified else None,  # THIS SHOULD BE ONLY FOR THOSE MODIFIED METHODS
                         new_file_path=next_path, 
                         new_label=new_label,  
                         new_start=next_start_pos, 
@@ -408,6 +431,7 @@ def run(
                         new_end_lno=next_end_lno, 
                         new_content=next_content, 
                         attribute_to_force='all'
+                        #new_mth_name_at_last_mod=mth_at_last_mod, 
                     )
                     # update global keys 
                     mth_uid_to_latest_lnokey[fpath_key][mth_uid] = new_mth_lno_key # update 
@@ -416,41 +440,52 @@ def run(
                         mth_latest_lnokey_to_uid[fpath_key][new_mth_lno_key] = mth_uid
                     else:
                         mth_latest_lnokey_to_uid[fpath_key][f"None-{mth_lno_key}-{commit.hash}"] = mth_uid
-                # temp 
                 curr_processed_modfiles.add(src_path) 
+            # update files_to_track 
             update_files_to_track(initial_to_latest, latest_to_initial, files_to_track, fpath_to_update)
+            changes_pcommit[commit.hash] = chg_inst # not sure whether will be used
+            # save chg_inst
+            save_file = os.path.join(OUTPUT_DIR, f"{commit.hash}.chgd_inst.json")
+            chg_inst.save(save_file)
     except Exception:
         # save 
-        # initial_to_latest, latest_to_initial, mth_uid_to_latest_lnokey, mth_latest_lnokey_to_uid = get_tracking_keys(methods_by_file)
         with open(INTERMEDIATE_RESULTFILE, 'wb') as f:
             pickle.dump(
                 {'output':methods_by_file, 
-                'index':{
-                    'initial_to_latest': initial_to_latest, 
-                    'latest_to_initial': latest_to_initial,
-                    'mth_uid_to_latest_lnokey': mth_uid_to_latest_lnokey, 
-                    'mth_latest_lnokey_to_uid': mth_latest_lnokey_to_uid
-                    }, 
-                'files_to_track':files_to_track, 
-                'curr_processed_modfiles': curr_processed_modfiles,
-                'last_commit_idx':last_commit_idx
+                 'index':{
+                     'initial_to_latest': initial_to_latest, 
+                     'latest_to_initial': latest_to_initial,
+                     'mth_uid_to_latest_lnokey': mth_uid_to_latest_lnokey, 
+                     'mth_latest_lnokey_to_uid': mth_latest_lnokey_to_uid
+                     }, 
+                 'files_to_track':files_to_track, 
+                 'curr_processed_modfiles': curr_processed_modfiles,
+                 'last_commit_idx':last_commit_idx
                 }, f) 
+            
+        save_inter_result(
+            methods_by_file, 
+            files_to_track, 
+            initial_to_latest, 
+            latest_to_initial, 
+            mth_uid_to_latest_lnokey, 
+            mth_latest_lnokey_to_uid, 
+            curr_processed_modfiles,
+            last_commit_idx
+            )
+        
         traceback.print_exc()
-    
-    # for continuous colleciton 
-    with open(INTERMEDIATE_RESULTFILE, 'wb') as f:
-        pickle.dump(
-            {'output':methods_by_file, 
-                'index':{
-                    'initial_to_latest': initial_to_latest, 
-                    'latest_to_initial': latest_to_initial,
-                    'mth_uid_to_latest_lnokey': mth_uid_to_latest_lnokey, 
-                    'mth_latest_lnokey_to_uid': mth_latest_lnokey_to_uid
-                    }, 
-                'files_to_track':files_to_track, 
-                'curr_processed_modfiles': curr_processed_modfiles,
-                'last_commit_idx':last_commit_idx
-            }, f) 
+        
+    save_inter_result(
+        methods_by_file, 
+        files_to_track, 
+        initial_to_latest, 
+        latest_to_initial, 
+        mth_uid_to_latest_lnokey, 
+        mth_latest_lnokey_to_uid, 
+        curr_processed_modfiles,
+        last_commit_idx
+        )
             
     return methods_by_file 
 
@@ -464,22 +499,24 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # set 
-    repo_path = "/Users/jeongjusohn/temp/lang_1b" #args.repo_dir
+    repo_path = "/Users/jeongjusohn/temp/lang_7b" #args.repo_dir
     GUMTREE_IMAGE = args.gumtree_image 
     GUMTREE_PLATFORM = args.gumtree_platform
     
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
+    OUTPUT_DIR = args.output_dir
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     host_path = "/Users/jeongjusohn/temp"
-    init_file = os.path.join(output_dir, 'init_file.json')
+    init_file = os.path.join(OUTPUT_DIR, 'init_file.json')
+    INTERMEDIATE_RESULTFILE  = INTERMEDIATE_RESULTFILE.format(OUTPUT_DIR)
     # testing 
     #target_types = None # Currently this run.py is for changeability analyses, meaning only for method-level [] # will look everything
     methods_by_file = run(
         repo_path, 
         host_path, 
-        target_files = None, #['src/main/java/org/apache/commons/lang3/reflect/FieldUtils.java'],
+        target_files = None, 
+        file_types = ['.java'], 
         time_window = 365*3, 
         init_file = init_file 
     )
-    with open(os.path.join(output_dir, 'test.pkl'), 'wb') as f:
+    with open(os.path.join(OUTPUT_DIR, 'test.pkl'), 'wb') as f:
         pickle.dump(methods_by_file, f)

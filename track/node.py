@@ -291,6 +291,7 @@ class TMethod(TNode):
         ) -> bool:
         # this is processing for the next update (not the current one)
         #try:
+        #print ("Updated", self.init_lno_key)
         super().update(
             commit_hash = commit_hash, 
             new_file_path = new_file_path, 

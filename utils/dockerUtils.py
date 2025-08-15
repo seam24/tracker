@@ -15,7 +15,7 @@ def run_docker_image(
 ) -> Tuple[int, str, str]:
     """
     Run a docker image with the given command and options.
-        e.g., docker run -v $PWD/NumberUtilsA.java:/diff/NumberUtilsA.java -v $PWD/NumberUtils.java:/diff/NumberUtils.java -p 4567:4567 gumtreediff/gumtree webdiff /diff/NumberUtilsA.java /diff/NumberUtils.java
+        e.g., docker run -v $PWD/NumberUtilsA.java:/diff/NumberUtilsA.java -v $PWD/NumberUtils.java:/9/NumberUtils.java -p 4567:4567 gumtreediff/gumtree webdiff /diff/NumberUtilsA.java /diff/NumberUtils.java
     
     Returns (exit_code, stdout, stderr).
     """
