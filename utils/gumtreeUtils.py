@@ -2,8 +2,9 @@
 Gumtree operations 
 """
 import os, sys
+import xml.etree.ElementTree as ET
 import utils.dockerUtils as dockerUtils
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union, Iterable
 
 VALID_CMDS = ['webdiff', 'cluster', 'dotdiff', 'htmldiff', 'list', 'parse', 'swingdiff', 'textdiff', 'axmldiff'] # likely for our case, mainly focus on axmldiff and parse
 
@@ -92,7 +93,6 @@ def analyse_mth_changes(
                 - label (method name or ID)
     """
     # will parse given raw changes, and return the mapped information   
-    import xml.etree.ElementTree as ET
     from utils.parseUtils import char_index_to_line
      
     root = ET.fromstring(diff_outputs)
@@ -134,14 +134,94 @@ def analyse_mth_changes(
             'end_lno':other_end_lno, 
             'label':label}
     return updated_mth_range
+
+
+def analyse_node_changes(
+    diff_outputs:str, 
+    #content_src:str, 
+    content_dst:str, 
+    types:Optional[Iterable[str]] = None, 
+) -> Dict[str, Dict[str, Union[int, str, None]]]:
+    """
+    Parse XML diff output to extract method declaration change information and map
+    character index ranges to line numbers in both source and destination contents.
+
+    Args:
+        diff_outputs (str): XML string output from a tree differencing tool (e.g., GumTree).
+        content_src (str): Source file content (before the change).
+        content_dst (str): Destination file content (after the change).
+
+    Returns:
+        Dict[str, Dict[str, Union[int, str, None]]]: A dictionary keyed by source line range
+            (e.g., "12-20"), each containing:
+                - start_pos, end_pos (in destination content)
+                - start_lno, end_lno (in destination)
+                - label (method name or ID)
+    """
+    # will parse given raw changes, and return the mapped information   
+    from utils.parseUtils import char_index_to_line
+     
+    root = ET.fromstring(diff_outputs)
+    # from tree, extract change information 
+    # consider that pydriller can't match the mdofiied line to a new line -> meaning we need to extract such informaton here
+    # as we need to update the method's range, which will be keep chaning. 
+    ## later for the update, the key would be .. if some methods have been changed,     
+    #chr_to_line_src = char_index_to_line(content_src)
+    chr_to_line_dst = char_index_to_line(content_dst)
     
+    type_filter = set(types) if types is not None else None
+    
+    out:Dict[str, Dict[str, Union[int, str, None]]] = {}
+    for element in root.iter():
+        node_type = element.get('type')
+        if node_type is None:
+            continue
+        if type_filter is not None and node_type not in type_filter:
+            continue
+        
+        # must have
+        pos = element.get("pos")
+        length = element.get("length")
+        if pos is None or length is None:
+            continue  # skip nodes without source range
+        try:
+            pos = int(pos)
+            length = int(length)
+        except ValueError:
+            continue  # malformed attributes; skip
+        start_pos = pos
+        end_pos = start_pos + length
+        
+        # optional destination range - e.g., deletion
+        other_pos = element.get('other_pos') 
+        if other_pos is not None: 
+            other_pos = int(other_pos)
+            other_length = int(element.get('other_length'))
+            other_start_lno = chr_to_line_dst[other_pos]
+            other_end_lno = chr_to_line_dst[other_pos + other_length]
+        else:
+            other_length = None
+            other_start_lno, other_end_lno = None, None
+        
+        # get label 
+        label = element.get('label')
+        out[f"{start_pos}-{end_pos}"] = {
+            'type':node_type, 
+            'start_pos':other_pos, 
+            'end_pos':other_pos + other_length if other_pos is not None else None, 
+            'start_lno':other_start_lno, 
+            'end_lno':other_end_lno, 
+            'label':label}
+    return out
+
 def diff(
     image:str, 
     srcfpath:str, 
     dstfpath:str, 
     platform:Optional[str] = "linux/amd64", 
     host_path:Optional[str] = None, 
-    container_path:Optional[str] = "/data"
+    container_path:Optional[str] = "/data", 
+    target_mths:bool = True
 ) -> Dict[str, Dict[str,int]]:
     """_summary_
 
@@ -188,11 +268,14 @@ def diff(
         diff_outputs, _ = out
         # parse file
         # currenlty target only the me
-        updated_mth_range = analyse_mth_changes(diff_outputs, content_src=src_fcontent, content_dst=dst_fcontent)
-        return updated_mth_range  
+        if target_mths:
+            ret = analyse_mth_changes(diff_outputs, content_src=src_fcontent, content_dst=dst_fcontent)
+        else:
+            ret = analyse_node_changes(diff_outputs, dst_fcontent)
+        return ret  
 
 
-def analyse_parsed(
+def get_target_nodes(
     node:Union[Dict, List], 
     target_types:Optional[List[str]] = None, #['MethodDeclaration']
 ) -> List[Dict]:
@@ -218,10 +301,10 @@ def analyse_parsed(
             if node_type in target_types or len(target_types) == 0:
                 collected.append(node)
         for child in node.get("children", []):
-            collected.extend(analyse_parsed(child, target_types))
+            collected.extend(get_target_nodes(child, target_types))
     elif isinstance(node, list):
         for item in node:
-            collected.extend(analyse_parsed(item, target_types))
+            collected.extend(get_target_nodes(item, target_types))
     return collected 
 
 
@@ -253,7 +336,7 @@ def parse(
             raw_parsed = json.load(f)
         root_node = raw_parsed.get('root')
         if root_node: 
-            mth_declrs = analyse_parsed(root_node, target_types)
+            mth_declrs = get_target_nodes(root_node, target_types)
             return mth_declrs
         else: # None 
             print (f"[Error] Invalid format. Please check {output_file}") 

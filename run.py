@@ -158,7 +158,16 @@ def update_files_to_track(initial_to_latest:Dict[str, str], latest_to_initial:Di
     updated_n = len(files_to_track)
     print (f"[# OF FILES-TO-TRACK] From {init_n} to {updated_n}")
     
-    
+def update_method_to_track(fpath:str, mth_latest_lnokey_to_uid:Dict[str,Dict[str,str]], 
+                           mth_uid_to_latest_lnokey:Dict[str, Dict[str,str]],
+                           to_update_mid_new:List[Tuple[str,str]]):
+    mth_uid_to_latest_lnokey[fpath] = dict()
+    mth_latest_lnokey_to_uid[fpath] = dict()
+    for mid, new_v in to_update_mid_new:
+        mth_uid_to_latest_lnokey[fpath][mid] = new_v
+        mth_latest_lnokey_to_uid[fpath][new_v] = mid 
+
+
 def get_tracking_keys(methods_by_file: Dict[str, Dict[str, TMethod]]) -> Tuple[Dict, Dict, Dict, Dict]:
     """_summary_
 
@@ -261,7 +270,6 @@ def run(
         initial_to_latest: Dict[str,str] = {fpath:fpath for fpath in methods_by_file}
         latest_to_initial: Dict[str,str] = {fpath:fpath for fpath in methods_by_file}
         # need to convert methods_by_file into dictionary 
-        #save_content(methods_by_file, init_file, as_binary=True)
         save_init_methods(methods_by_file, init_file)
     initial_to_latest, latest_to_initial, mth_uid_to_latest_lnokey, mth_latest_lnokey_to_uid = get_tracking_keys(methods_by_file)
     files_to_track = set(list(methods_by_file.keys()))
@@ -274,7 +282,6 @@ def run(
     if os.path.exists(INTERMEDIATE_RESULTFILE): 
         with open(INTERMEDIATE_RESULTFILE, 'rb') as f:
             inter_results = pickle.load(f)
-
         methods_by_file = inter_results['output']
         initial_to_latest = inter_results['index']['initial_to_latest']
         latest_to_initial = inter_results['index']['latest_to_initial']
@@ -296,6 +303,7 @@ def run(
     
     already_processed = curr_processed_modfiles
     curr_processed_modfiles = set()
+    initial_targets = {fpath_key:[mth.lno_key for mth in mths.values() if mth.lno_key is not None] for fpath_key,mths in methods_by_file.items()}
     # chnage init start
     changes_pcommit = {}
     # change init end
@@ -327,6 +335,7 @@ def run(
             )
             # setchange set end 
             fpath_to_update:Dict[str, str] = {} # afpath(src) : bfpath(dst)
+            #to_update_mid_new = []
             for modified_file in commit.modified_files:
                 # skip those alreaady processed (while continuing with inter) 
                 if i == 0:
@@ -350,11 +359,11 @@ def run(
                     continue
                 
                 # We need to get the file as "as-is" instead of decoded string to match with the outputs provided by gumtree
-                out = GitRepoHelper.get_file_content(rpHelper.get_git_commit(commit.hash), src_path)
+                out = GitRepoHelper.get_file_content(rpHelper.get_git_commit(commit.hash), src_path)#, encoding='utf-8')
                 if out is None:
                     raise ValueError(f"Failed to retrive {src_path}")
                 srcode_src, _ = out 
-                out = GitRepoHelper.get_file_content(rpHelper.get_git_commit(prev_commit.hash), dst_path)
+                out = GitRepoHelper.get_file_content(rpHelper.get_git_commit(prev_commit.hash), dst_path)#, encoding='utf-8')
                 if out is None:
                     raise ValueError(f"Failed to retrive {dst_path}") 
                 srcode_dst, _ = out
@@ -382,8 +391,11 @@ def run(
                 # tmth_diff_range is for updated method, and mth_lno_key is before the updated
                 # Get a list of modified methods 
                 modified_mths = modified_file.changed_methods
-                #end_lno_of_modified_mths = set([mth.end_line for mth in modified_mths]) #
                 end_lno_of_modified_mths = {mth.end_line:mth.long_name for mth in modified_mths}
+                #
+                to_update_mid_new = []
+                #
+                _init_targets_to_replace = []
                 for mth_lno_key, tmth_diff_range in updated_mth_range.items(): 
                     ####mth_at_last_mod = mth.long_name # from the src commit (not dst)
                     # update for the next parsing
@@ -405,9 +417,13 @@ def run(
                     # update method node (TMethod)
                     try:
                         mth_uid = mth_latest_lnokey_to_uid[fpath_key][mth_lno_key]
-                    except KeyError:
+                    except KeyError: # as e:
+                        # "Currently" two cases are possible: 
+                        #   - failure to map in the previous case
+                        #   - or, the method was newly introduced at the commit (src_code side), so not in the original target
                         if fpath_key in mth_latest_lnokey_to_uid.keys():
-                            print (f"[Log] Failure on mapping at {commit.hash}: {mth_lno_key} from {src_path} is missing") 
+                            if mth_lno_key in initial_targets[fpath_key]:
+                                print (f"[Log] Failure on mapping at {commit.hash}: {mth_lno_key} from {src_path} is missing") 
                         else:
                             print (f"[Log] Failure on mapping at {commit.hash}: {fpath_key} representing {src_path} is missing")
                         continue
@@ -418,9 +434,13 @@ def run(
                     has_mth_modified = tmth_node.end_lno in end_lno_of_modified_mths
                     if has_mth_modified:
                         mth_raw_str_diff = Change.get_diff(tmth_node.content, next_content, reverse=True)
-                        chg_inst.set_mth_diff(src_path, end_lno_of_modified_mths[tmth_node.end_lno], mth_raw_str_diff)
+                        chg_inst.set_mth_diff(
+                            src_path, 
+                            end_lno_of_modified_mths[tmth_node.end_lno], 
+                            tmth_node.init_lno_key, 
+                            mth_raw_str_diff
+                        )
                     # end 
-                    
                     tmth_node.update(
                         commit_hash=commit.hash if has_mth_modified else None,  # THIS SHOULD BE ONLY FOR THOSE MODIFIED METHODS
                         new_file_path=next_path, 
@@ -433,15 +453,31 @@ def run(
                         attribute_to_force='all'
                         #new_mth_name_at_last_mod=mth_at_last_mod, 
                     )
-                    # update global keys 
-                    mth_uid_to_latest_lnokey[fpath_key][mth_uid] = new_mth_lno_key # update 
-                    del mth_latest_lnokey_to_uid[fpath_key][mth_lno_key]
-                    if new_mth_lno_key is not None:
-                        mth_latest_lnokey_to_uid[fpath_key][new_mth_lno_key] = mth_uid
+                    # prepare the updates of the global mth keys 
+                    if new_mth_lno_key is None:
+                        new_mth_lno_key = f"None-{mth_lno_key}-{commit.hash}"
                     else:
-                        mth_latest_lnokey_to_uid[fpath_key][f"None-{mth_lno_key}-{commit.hash}"] = mth_uid
-                curr_processed_modfiles.add(src_path) 
-            # update files_to_track 
+                        _init_targets_to_replace.append(new_mth_lno_key)
+                        
+                    to_update_mid_new.append((mth_uid, new_mth_lno_key))
+                    print (f"[Update] Will updated from {mth_lno_key} -> {new_mth_lno_key} for {mth_uid}")
+                    # mth_uid_to_latest_lnokey[fpath_key][mth_uid] = new_mth_lno_key # update 
+                    # ##
+                    # del mth_latest_lnokey_to_uid[fpath_key][mth_lno_key] # currently, accidently delete the correct keys
+                    # print (f"[Update] Will updated from {mth_lno_key} -> {new_mth_lno_key} for {mth_uid}")
+                    # if new_mth_lno_key is not None:
+                    #     mth_latest_lnokey_to_uid[fpath_key][new_mth_lno_key] = mth_uid
+                    # else: # the case where the method doesn't exist any more
+                    #     mth_latest_lnokey_to_uid[fpath_key][f"None-{mth_lno_key}-{commit.hash}"] = mth_uid
+                update_method_to_track(
+                        fpath_key, 
+                        mth_latest_lnokey_to_uid, #[fpath_key], 
+                        mth_uid_to_latest_lnokey, #[fpath_key], 
+                        to_update_mid_new
+                )    
+                curr_processed_modfiles.add(src_path)
+                initial_targets[fpath_key] = _init_targets_to_replace
+            # update files_to_track  and methods to track for each 
             update_files_to_track(initial_to_latest, latest_to_initial, files_to_track, fpath_to_update)
             changes_pcommit[commit.hash] = chg_inst # not sure whether will be used
             # save chg_inst
@@ -496,6 +532,7 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--repo_dir", default = ".")
     parser.add_argument("-gumtree", "--gumtree_image", type = str, default = "gumtreediff/gumtree:latest")
     parser.add_argument("-gplt", "--gumtree_platform", type = str, default = 'linux/amd64')
+    parser.add_argument("-tw", "--time_window", default = 30, help = "a time window for change-tracking; in days")
     args = parser.parse_args()
     
     # set 
@@ -515,7 +552,7 @@ if __name__ == "__main__":
         host_path, 
         target_files = None, 
         file_types = ['.java'], 
-        time_window = 365*3, 
+        time_window = 365*2, 
         init_file = init_file 
     )
     with open(os.path.join(OUTPUT_DIR, 'test.pkl'), 'wb') as f:
