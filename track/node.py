@@ -49,7 +49,20 @@ class TNode:
         self.init_pos_key = self.pos_key
         self.init_lno_key = self.lno_key
         self.init_content = self.content
-           
+   
+    def gen_sub_child_node(self, child:Dict, file_path:str, local_file_path:str, file_content:str) -> "TMethod":
+        child_node = TNode(
+            child.get('type'),
+            file_path, 
+            int(child.get('pos')), 
+            int(child.get('length')), 
+            child.get('childeren'), 
+            child.get('label'), 
+            local_file_path=local_file_path, 
+            file_content=file_content
+        )
+        return child_node
+            
     @classmethod
     def from_dict(cls, d:Dict, asTNodes:Optional[List[str]] = None) -> "TNode":
         """_summary_
@@ -119,8 +132,6 @@ class TNode:
 
         _start = self.start if idx_range is None else idx_range[0]
         _end = self.end if idx_range is None else idx_range[1]
-        #print ("currently", _end, len(file_content))#type(_end))
-        #print (self.start, self.length, self.end)
         if len(file_content) >= _end:
             self.content = file_content[_start:_end] 
             if set_lno_info: 
@@ -141,7 +152,6 @@ class TNode:
             commit_hash (str): _description_
         """
         if commit_hash is not None:
-            #print ("Updated", commit_hash)
             self.chgd_ats.append(commit_hash)
 
     def conditional_update(self, attr_name: str, new_value, force: bool = False):
@@ -256,25 +266,27 @@ class TMethod(TNode):
         # for javadoc and block, during the initialisatin, Javadoc and Block's content will be set 
         for child in self.children:
             if child.get('type') == 'Javadoc':
-                self.javadoc = TNode(
-                    child.get('type'),
-                    file_path,  
-                    int(child.get('pos')), 
-                    int(child.get('length')), 
-                    child.get('childeren'), 
-                    child.get('label'), 
-                    local_file_path=local_file_path, 
-                    file_content=file_content)
+                self.javadoc = self.gen_sub_child_node(child, file_path, local_file_path, file_content)
+                # TNode(
+                #     child.get('type'),
+                #     file_path,  
+                #     int(child.get('pos')), 
+                #     int(child.get('length')), 
+                #     child.get('childeren'), 
+                #     child.get('label'), 
+                #     local_file_path=local_file_path, 
+                #     file_content=file_content)
             elif child.get('type') == 'Block':
-                self.block = TNode(
-                    child.get('type'), 
-                    file_path, 
-                    int(child.get('pos')), 
-                    int(child.get('length')), 
-                    child.get('childeren'), 
-                    child.get('label'), 
-                    local_file_path=local_file_path, 
-                    file_content=file_content)
+                self.block = self.gen_sub_child_node(child, file_path, local_file_path, file_content)
+                # TNode(
+                #     child.get('type'), 
+                #     file_path, 
+                #     int(child.get('pos')), 
+                #     int(child.get('length')), 
+                #     child.get('childeren'), 
+                #     child.get('label'), 
+                #     local_file_path=local_file_path, 
+                #     file_content=file_content)
         self.mth_name_at_last_mod = None # "at" commit that changed the method (for initilisation, this is None (due to the initialisation via pasring))
         
     def update(self,
@@ -290,8 +302,6 @@ class TMethod(TNode):
                attribute_to_force:Optional[List[str]] = None
         ) -> bool:
         # this is processing for the next update (not the current one)
-        #try:
-        #print ("Updated", self.init_lno_key)
         super().update(
             commit_hash = commit_hash, 
             new_file_path = new_file_path, 
@@ -303,12 +313,14 @@ class TMethod(TNode):
             new_content = new_content, 
             attribute_to_force = attribute_to_force
         )
+        
         try:
             force_flag = True if (attribute_to_force is not None) and ('mth_name_at_last_mod' in attribute_to_force) else False
             self.conditional_update('mth_name_at_last_mod', new_mth_name_at_last_mod, force = force_flag)
             return True
         except Exception as e:
             raise type(e)(f"[Failure] Something went wrong during the method update\n\t{e}") from e
+        
     # def set_mthID(self):
     #     if self.label is not None:
     #         return self.label

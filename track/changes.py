@@ -54,7 +54,12 @@ class Change:
                 lineterm=""
             )
         )
-        return "\n".join(diff_lines) #if as_str else diff_lines
+        unwanted_prefixes = ("@@", "--- new", "+++ old")
+        cleaned_diff = "\n".join(
+            line for line in diff_lines
+            if not line.startswith(unwanted_prefixes)
+        )
+        return cleaned_diff #if as_str else diff_lines
         
     def set_mth_diff(self, modified_fpath:str, mth_longname:str, mth_id:str, mth_diff:Optional[str]):
         if self.mths_diff.get(modified_fpath) is None:
@@ -107,22 +112,3 @@ class Change:
         self.mths_diff = data.get('mths_diff')
         self.mth_ids_of_chgds = data.get('mth_ids_of_chgds')
         
-
-# class ChangeSet:
-#     def __init__(self):
-#         self.changes:Dict[str, Change] = {} # key (str) will be commit_has
-    
-#     def update(self, chg_inst:Change):
-#         self.changes.update({chg_inst.commit_hash:chg_inst})
-    
-#     def get_commit_hashes(self) -> List[str]:
-#         return list(self.changes)
-    
-#     def save(self, filepath:Optional[str]): 
-#         # need to format change inst wihtin 
-#         try:
-#             with open(filepath, 'w') as f:
-#                 pass 
-#         except FileNotFoundError:
-#             raise Exception(f"[FileNotFoundError] {filepath} does not exist") 
-    

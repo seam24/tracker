@@ -8,6 +8,10 @@ from typing import List, Dict, Tuple, Optional, Union, Iterable
 
 VALID_CMDS = ['webdiff', 'cluster', 'dotdiff', 'htmldiff', 'list', 'parse', 'swingdiff', 'textdiff', 'axmldiff'] # likely for our case, mainly focus on axmldiff and parse
 
+class InvalidOutputError(Exception):
+    """Raise invalid output error"""
+    pass
+    
 def run_docker(
     image:str, 
     cmd:str,
@@ -138,7 +142,7 @@ def analyse_mth_changes(
 
 def analyse_node_changes(
     diff_outputs:str, 
-    #content_src:str, 
+    content_src:str, 
     content_dst:str, 
     types:Optional[Iterable[str]] = None, 
 ) -> Dict[str, Dict[str, Union[int, str, None]]]:
@@ -156,62 +160,83 @@ def analyse_node_changes(
             (e.g., "12-20"), each containing:
                 - start_pos, end_pos (in destination content)
                 - start_lno, end_lno (in destination)
-                - label (method name or ID)
+                - label (method name or ID [optional (None)])
     """
     # will parse given raw changes, and return the mapped information   
     from utils.parseUtils import char_index_to_line
      
     root = ET.fromstring(diff_outputs)
-    # from tree, extract change information 
-    # consider that pydriller can't match the mdofiied line to a new line -> meaning we need to extract such informaton here
-    # as we need to update the method's range, which will be keep chaning. 
-    ## later for the update, the key would be .. if some methods have been changed,     
-    #chr_to_line_src = char_index_to_line(content_src)
+
+    chr_to_line_src = char_index_to_line(content_src)
     chr_to_line_dst = char_index_to_line(content_dst)
     
     type_filter = set(types) if types is not None else None
     
     out:Dict[str, Dict[str, Union[int, str, None]]] = {}
     for element in root.iter():
+        src_pos, src_end_pos = None, None # for default key
         node_type = element.get('type')
-        if node_type is None:
+        if (node_type is None) or (
+            type_filter is not None and node_type not in type_filter
+        ):
             continue
-        if type_filter is not None and node_type not in type_filter:
-            continue
-        
-        # must have
-        pos = element.get("pos")
-        length = element.get("length")
-        if pos is None or length is None:
-            continue  # skip nodes without source range
+    
         try:
-            pos = int(pos)
-            length = int(length)
-        except ValueError:
-            continue  # malformed attributes; skip
-        start_pos = pos
-        end_pos = start_pos + length
+            # must have
+            src_pos = element.get("pos")
+            src_length = element.get("length")
+            if src_pos is None or src_length is None: 
+                src_pos, src_end_pos = None, None 
+                raise InvalidOutputError("[Invalid Output] pos and length must exist")
         
-        # optional destination range - e.g., deletion
-        other_pos = element.get('other_pos') 
-        if other_pos is not None: 
-            other_pos = int(other_pos)
-            other_length = int(element.get('other_length'))
-            other_start_lno = chr_to_line_dst[other_pos]
-            other_end_lno = chr_to_line_dst[other_pos + other_length]
-        else:
-            other_length = None
-            other_start_lno, other_end_lno = None, None
+            src_pos = int(src_pos)
+            src_length = int(src_length)
+            src_end_pos = src_pos + src_length
+            src_start_lno = chr_to_line_src[src_pos]
+            src_end_lno = chr_to_line_src[src_pos + src_length]
+            
+            # optional destination range - e.g., deletion
+            dst_pos = element.get('other_pos')
+            dst_length = element.get('other_pos')
+            if dst_pos is None:
+                if dst_length is None:
+                    raise TypeError(f"Node {src_pos}-{src_end_pos} has been deleted")
+                else:
+                    dst_length = None
+                    raise InvalidOutputError(f"[Invalid Output] 'other_length' must be also None: {dst_length}for the node-{src_pos}-{src_end_pos}") 
+            
+            dst_pos = int(dst_pos)
+            dst_length = int(dst_length)
+            dst_end_pos = dst_pos + dst_length
+            dst_start_lno = chr_to_line_dst[dst_pos]
+            dst_end_lno = chr_to_line_dst[dst_pos + dst_length]
+           
+        except InvalidOutputError as e:
+            raise e
+        except KeyError as e:
+            raise type(e)("[PosNotExist] position does not exist in chr_to_line_src/dst") from e
+        except TypeError as e: # None
+            print (e)
+            dst_pos, dst_end_pos = None, None
+            dst_start_lno, dst_end_lno = None, None
+        except ValueError as e: # malformed attributes
+            raise type(e)("[Invalid value] malformed attributes") from e
         
         # get label 
         label = element.get('label')
-        out[f"{start_pos}-{end_pos}"] = {
-            'type':node_type, 
-            'start_pos':other_pos, 
-            'end_pos':other_pos + other_length if other_pos is not None else None, 
-            'start_lno':other_start_lno, 
-            'end_lno':other_end_lno, 
-            'label':label}
+        key = f"{src_pos}-{src_end_pos}"
+        out[key] = {
+            "type": node_type,
+            "label": label,
+            "src_start_pos": src_pos,
+            "src_end_pos": src_end_pos,
+            "dst_start_pos": dst_pos,
+            "dst_end_pos": dst_end_pos,
+            "src_start_lno": src_start_lno,
+            "src_end_lno": src_end_lno,
+            "dst_start_lno": dst_start_lno,
+            "dst_end_lno": dst_end_lno,
+        }
     return out
 
 def diff(
@@ -221,7 +246,7 @@ def diff(
     platform:Optional[str] = "linux/amd64", 
     host_path:Optional[str] = None, 
     container_path:Optional[str] = "/data", 
-    target_mths:bool = True
+    target_only_mths:bool = True
 ) -> Dict[str, Dict[str,int]]:
     """_summary_
 
@@ -268,10 +293,10 @@ def diff(
         diff_outputs, _ = out
         # parse file
         # currenlty target only the me
-        if target_mths:
+        if target_only_mths:
             ret = analyse_mth_changes(diff_outputs, content_src=src_fcontent, content_dst=dst_fcontent)
         else:
-            ret = analyse_node_changes(diff_outputs, dst_fcontent)
+            ret = analyse_node_changes(diff_outputs, content_src=src_fcontent, content_dst=dst_fcontent)
         return ret  
 
 
