@@ -4,7 +4,8 @@ Gumtree operations
 import os, sys
 import xml.etree.ElementTree as ET
 import utils.dockerUtils as dockerUtils
-from typing import List, Dict, Tuple, Optional, Union, Iterable
+from typing import List, Dict, Tuple, Optional, Union, Iterable, Any
+import json 
 
 VALID_CMDS = ['webdiff', 'cluster', 'dotdiff', 'htmldiff', 'list', 'parse', 'swingdiff', 'textdiff', 'axmldiff'] # likely for our case, mainly focus on axmldiff and parse
 
@@ -129,14 +130,14 @@ def analyse_mth_changes(
         end_lno = chr_to_line_src[pos + length]
 
         # get label 
-        label = mth_declar.get('label')
+        #label = mth_declar.get('label')
         
         updated_mth_range[f"{start_lno}-{end_lno}"] = {
             'start_pos':other_pos, 
             'end_pos':other_pos + other_length if other_pos is not None else None, 
             'start_lno':other_start_lno, 
-            'end_lno':other_end_lno, 
-            'label':label}
+            'end_lno':other_end_lno}
+            #'label':label}
     return updated_mth_range
 
 
@@ -368,4 +369,155 @@ def parse(
             return None 
     else:
         return None
+
+#################################################################################################
+#                                   Method Labeling Parsing                                     #
+#################################################################################################
+CLASS_LIKE = {"TypeDeclaration", "EnumDeclaration", "AnnotationTypeDeclaration"}
+
+def _child(n: Dict[str, Any], t: str) -> Optional[Dict[str, Any]]:
+    return next((c for c in n.get("children", []) if c.get("type") == t), None)
+
+def _children(n: Dict[str, Any], t: str) -> List[Dict[str, Any]]:
+    return [c for c in n.get("children", []) if c.get("type") == t]
+
+def _type_to_str_minimal(type_node: Optional[Dict[str, Any]]) -> str: # deprecated
+    if not type_node:
+        return "?"
+    # Prefer explicit text if present
+    lbl = type_node.get("label")
+    if lbl:
+        return lbl
+    # Otherwise try nested SimpleName.label
+    sn = _child(type_node, "SimpleName")
+    if sn and sn.get("label"):
+        return sn["label"]
+    # Fallback: collect any labels in subtree
+    parts: List[str] = []
+    stack = [type_node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            if n.get("label"):
+                parts.append(n["label"])
+            stack.extend(n.get("children", []))
+    return "".join(parts) or "?"
+
+def _base_name_from_simple(n: Dict[str, Any]) -> str:
+    # Try label first, then nested SimpleName.label
+    if n.get("label"):
+        return n["label"]
+    sn = _child(n, "SimpleName")
+    return sn["label"] if sn and sn.get("label") else "?"
+
+def _type_to_str(tn: Optional[Dict[str, Any]]) -> str:
+    """Reconstruct a Java type string from a GumTree/JavaParser type subtree."""
+    if not tn:
+        return "?"
+    t = tn.get("type")
+
+    # Simple/primitive/void types
+    if t in ("SimpleType", "PrimitiveType", "VoidType"):
+        return _base_name_from_simple(tn)
+
+    # QualifiedType: prefix.SimpleName
+    if t == "QualifiedType":
+        prefix = _child(tn, "SimpleType") or _child(tn, "QualifiedType")
+        name = _child(tn, "SimpleName")
+        left = _type_to_str(prefix) if prefix else "?"
+        right = name["label"] if name and name.get("label") else "?"
+        return f"{left}.{right}"
+
+    # ArrayType: elementType[]
+    if t == "ArrayType":
+        # Element can itself be ArrayType / ParameterizedType / SimpleType / PrimitiveType
+        elem = (
+            _child(tn, "ArrayType")
+            or _child(tn, "ParameterizedType")
+            or _child(tn, "SimpleType")
+            or _child(tn, "PrimitiveType")
+            or _child(tn, "QualifiedType")
+        )
+        # Count nested ArrayType levels
+        levels = 0
+        cur = tn
+        while cur and cur.get("type") == "ArrayType":
+            levels += 1
+            cur = _child(cur, "ArrayType")  # dive if nested
+        return _type_to_str(elem) + "[]" * levels
+
+    # ParameterizedType: MainType<Arg1,Arg2,...>
+    if t == "ParameterizedType":
+        main = (
+            _child(tn, "SimpleType")
+            or _child(tn, "QualifiedType")
+            or _child(tn, "PrimitiveType")
+        )
+        # Type arguments may be SimpleType / ParameterizedType / ArrayType / QualifiedType / WildcardType
+        args_nodes: List[Dict[str, Any]] = []
+        for k in ("SimpleType", "ParameterizedType", "ArrayType", "QualifiedType", "WildcardType"):
+            args_nodes.extend(_children(tn, k))
+        args = ",".join(_type_to_str(a) for a in args_nodes)
+        return f"{_type_to_str(main)}<{args}>"
+
+    # WildcardType: ?, ? extends T, ? super T (best effort)
+    if t == "WildcardType":
+        bound = (
+            _child(tn, "SimpleType")
+            or _child(tn, "QualifiedType")
+            or _child(tn, "ParameterizedType")
+            or _child(tn, "ArrayType")
+        )
+        # Bound keywords aren’t always explicit in the JSON; show best-effort
+        return f"? { _type_to_str(bound) }" if bound else "?"
+
+    # Fallback: collect labels in subtree
+    lbl = tn.get("label")
+    if lbl:
+        return lbl
+    parts: List[str] = []
+    stack = [tn]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            if n.get("label"):
+                parts.append(n["label"])
+            stack.extend(n.get("children", []))
+    return "".join(parts) or "?"
+
+def _param_sig(method_node: Dict[str, Any]) -> str:
+    # Params are SingleVariableDeclaration with a *Type child
+    params = _children(method_node, "SingleVariableDeclaration")
+    types: List[str] = []
+    for p in params:
+        t = (
+            _child(p, "ArrayType")
+            or _child(p, "ParameterizedType")
+            or _child(p, "QualifiedType")
+            or _child(p, "SimpleType")
+            or _child(p, "PrimitiveType")
+        )
+        types.append(_type_to_str(t))
+    return ",".join(types)
+
+    
+def method_local_signature(
+    method_node: Dict[str, Any],
+    enclosing_classes: Optional[List[str]] = None,
+) -> str:
+    """
+    Build a local method signature for a single MethodDeclaration node:
+      Outer.Inner#method(Type1,Type2[])
+    - Constructors are already represented as MethodDeclaration with class name as SimpleName (per your data).
+    - If enclosing_classes is omitted, the class qualifier is omitted.
+    """
+    name_node = _child(method_node, "SimpleName") # method name lives in child SimpleName
+    method_name = (name_node or method_node).get("label") or "unnamed"
+    params = _param_sig(method_node)
+
+    if enclosing_classes:
+        cls = ".".join(enclosing_classes)
+        return f"{cls}#{method_name}({params})"
+    else:
+        return f"{method_name}({params})"
 

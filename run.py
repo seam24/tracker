@@ -78,7 +78,8 @@ def init(
                 pos = int(mth_declr.get('pos'))
                 length = int(mth_declr.get('length'))
                 children = mth_declr.get('children')
-                label = mth_declr.get('label')
+                #label = mth_declr.get('label')
+                label = gumtreeUtils.method_local_signature(mth_declr)
                 mth_node = TMethod(
                     file_path = target_file, 
                     pos = pos, 
@@ -271,6 +272,7 @@ def run(
         latest_to_initial: Dict[str,str] = {fpath:fpath for fpath in methods_by_file}
         # need to convert methods_by_file into dictionary 
         save_init_methods(methods_by_file, init_file)
+    sys.exit()
     initial_to_latest, latest_to_initial, mth_uid_to_latest_lnokey, mth_latest_lnokey_to_uid = get_tracking_keys(methods_by_file)
     files_to_track = set(list(methods_by_file.keys()))
     time_window = time_window * (60*60*24) # in seconds 
@@ -406,7 +408,7 @@ def run(
                     next_start_lno = tmth_diff_range.get('start_lno')
                     next_end_lno = tmth_diff_range.get('end_lno')
                     #
-                    new_label = updated_mth_range.get('label') # from the src commit (not dst) 
+                    #new_label = updated_mth_range.get('label') # from the src commit (not dst) 
                     if next_start_pos is None: 
                         next_content = None
                         new_mth_lno_key = None
@@ -444,7 +446,7 @@ def run(
                     tmth_node.update(
                         commit_hash=commit.hash if has_mth_modified else None,  # THIS SHOULD BE ONLY FOR THOSE MODIFIED METHODS
                         new_file_path=next_path, 
-                        new_label=new_label,  
+                        #new_label=new_label,  
                         new_start=next_start_pos, 
                         new_end=next_end_pos, 
                         new_start_lno=next_start_lno, 
@@ -555,5 +557,5 @@ if __name__ == "__main__":
         time_window = 365*2, 
         init_file = init_file 
     )
-    with open(os.path.join(OUTPUT_DIR, 'test.pkl'), 'wb') as f:
+    with open(os.path.join(OUTPUT_DIR, 'mths_hist.pkl'), 'wb') as f:
         pickle.dump(methods_by_file, f)
