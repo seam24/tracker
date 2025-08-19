@@ -7,7 +7,7 @@ import difflib
 
 class Change:
     def __init__(self, 
-                 commit_hash:str, 
+                 commit_hash:Optional[str]= None, 
                  author:Optional[str]= None, 
                  author_email:Optional[str]= None, 
                  author_date:Optional[str]= None,
@@ -32,8 +32,8 @@ class Change:
             self.author_date = author_date
             self.msg = msg
             self.modified_fpaths = modified_fpaths
-        self.mths_diff = {fpath:dict() for fpath in self.modified_fpaths} # mth_longname:mth_diff
-        self.mth_ids_of_chgds = {fpath:dict() for fpath in self.modified_fpaths}
+            self.mths_diff = {fpath:dict() for fpath in self.modified_fpaths} # mth_longname:mth_diff
+            self.mth_ids_of_chgds = {fpath:dict() for fpath in self.modified_fpaths}
     
     @staticmethod
     def get_diff(content_a:Optional[str], content_b:Optional[str], reverse:bool = False) -> str:
@@ -69,17 +69,13 @@ class Change:
             self.mth_ids_of_chgds[modified_fpath][mth_id] = mth_longname
             self.mths_diff[modified_fpath][mth_longname] = mth_diff
     
-    # def get_mths_diff_as_str(self) -> str:
-    #     # format all method diff to string (for prompting .. not sure whether I will have this here)
-    #     pass 
-    
     def save(self, to_save_file:str):
         to_save = {
                 'commit_hash': self.commit_hash, 
                 'author': self.author, 
                 'author_email': self.author_email, 
                 'author_date': self.author_date, 
-                'msg ': self.msg, 
+                'msg': self.msg, 
                 'modified_fpaths':self.modified_fpaths, 
                 'mths_diff': self.mths_diff , 
                 'mth_ids_of_chgds': self.mth_ids_of_chgds
@@ -98,8 +94,8 @@ class Change:
             Exception: _description_
         """
         try:
-            with open(save_file) as f:
-                data = json.load(save_file)
+            with open(save_file, encoding = 'utf-8') as f:
+                data = json.load(f)
         except FileNotFoundError as e: 
             raise type(e)(f"[FileNotFoundError] {save_file} does not exist") from e
 
