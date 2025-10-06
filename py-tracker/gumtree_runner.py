@@ -3,6 +3,7 @@ import tempfile
 import os
 import xml.etree.ElementTree as ET
 from typing import Dict, Optional, Union, Iterable
+import uuid
 
 class InvalidOutputError(Exception):
     """Raise invalid output error"""
@@ -65,12 +66,15 @@ def gumdiff(src1: str, src2: str, lang: str = ".py", commands: list[str] = None)
         If the GumTree process fails.
     """
     if commands is None:
-        commands = ["axmldiff"]
+        commands = ["textdiff"]  # or whatever GumTree subcommand you use
 
-    # Use a temporary directory to write code files for GumTree to compare
     with tempfile.TemporaryDirectory() as tmp:
-        a_path = os.path.join(tmp, f"a{lang}")
-        b_path = os.path.join(tmp, f"b{lang}")
+        # Generate random filenames
+        a_name = f"{uuid.uuid4().hex}{lang}"
+        b_name = f"{uuid.uuid4().hex}{lang}"
+
+        a_path = os.path.join(tmp, a_name)
+        b_path = os.path.join(tmp, b_name)
 
         with open(a_path, "w") as f:
             f.write(src1)
@@ -82,7 +86,7 @@ def gumdiff(src1: str, src2: str, lang: str = ".py", commands: list[str] = None)
             "docker", "run", "--rm",
             "-v", f"{tmp}:/diff",
             "gumtreediff/gumtree"
-        ] + commands + [f"a{lang}", f"b{lang}"]
+        ] + commands + [a_name, b_name]  # use the random names
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -91,75 +95,6 @@ def gumdiff(src1: str, src2: str, lang: str = ".py", commands: list[str] = None)
 
         return result.stdout
 
-
-def analyse_mth_changes(
-        # target_mthinfos:Dict[str, Dict[str,Union[List[int], str]]],
-        diff_outputs: str,
-        content_src: str,
-        content_dst: str
-) -> Dict[str, Dict[str, Union[int, str, None]]]:
-    """
-    Parse XML diff output to extract method declaration change information and map
-    character index ranges to line numbers in both source and destination contents.
-
-    Args:
-        diff_outputs (str): XML string output from a tree differencing tool (e.g., GumTree).
-        content_src (str): Source file content (before the change).
-        content_dst (str): Destination file content (after the change).
-
-    Returns:
-        Dict[str, Dict[str, Union[int, str, None]]]: A dictionary keyed by source line range
-            (e.g., "12-20"), each containing:
-                - start_pos, end_pos (in destination content)
-                - start_lno, end_lno (in destination)
-                - label (method name or ID)
-    """
-
-    root = ET.fromstring(diff_outputs)
-    # from tree, extract change information
-    # consider that pydriller can't match the mdofiied line to a new line -> meaning we need to extract such informaton here
-    # as we need to update the method's range, which will be keep chaning.
-    ## later for the update, the key would be .. if some methods have been changed,
-    chr_to_line_src = char_index_to_line(content_src)
-    chr_to_line_dst = char_index_to_line(content_dst)
-
-    updated_mth_range = {}
-    mthod_declars =[]
-    for element in root.iter():
-        node_type = element.get('type')
-        if node_type =="funcdef":
-            mthod_declars.append(element)
-
-    for mth_declar in mthod_declars:
-        # --- source node ---
-        pos = int(mth_declar.get('pos'))
-        length = int(mth_declar.get('length'))
-        end_pos = pos + length - 1  # fix off-by-one
-        start_lno = chr_to_line_src[pos]
-        end_lno = chr_to_line_src[end_pos]
-
-        # --- destination node (if mapped) ---
-        other_pos = mth_declar.get('other_pos')
-        if other_pos is not None:
-            other_pos = int(other_pos)
-            other_length = int(mth_declar.get('other_length'))
-            other_end_pos = other_pos + other_length - 1
-            other_start_lno = chr_to_line_dst[other_pos]
-            other_end_lno = chr_to_line_dst[other_end_pos]
-        else:
-            other_pos = None
-            other_end_pos = None
-            other_start_lno = None
-            other_end_lno = None
-
-        updated_mth_range[f"{start_lno}-{end_lno}"] = {
-            "start_pos": other_pos,
-            "end_pos": other_end_pos,
-            "start_lno": other_start_lno,
-            "end_lno": other_end_lno
-        }
-
-    return updated_mth_range
 
 def analyse_node_changes(
         diff_outputs: str,
@@ -279,7 +214,7 @@ def diff(a:str,b:str, lang:str=".py",target_only_mths:bool = True):
     diff_out=gumdiff(a,b,lang,commands=["axmldiff"])
     #print(diff_out)
     if target_only_mths:
-        ret = analyse_mth_changes(diff_out, content_src=a, content_dst=b)
+        raise NotImplementedError("analyse_mth_changes method has not been implemented!")
     else:
         ret = analyse_node_changes(diff_out, content_src=a, content_dst=b)
     return ret
@@ -297,20 +232,21 @@ if __name__ == "__main__":
     mutant_value="=="
     m_pos_key = f"{m_start_pos}-{m_end_pos}"
     tnode = updated_node_range.get(m_pos_key)
+    # for k in updated_node_range:
+    #     print(k,updated_node_range[k])
+    #     input()
+    # exit()
     print(tnode)
     if tnode is None:  # does not exist
         raise MutTrackFailureError(f"[Mutant-Track] failed to find the mutant {mid} at {m_pos_key}")
-
     # replace
     dst_start_pos, dst_end_pos = tnode['dst_start_pos'], tnode['dst_end_pos']
-
     if dst_start_pos is None:  # deleted
         #TODO: UPDATE KEEP TRACK
         print(f"[Log] mutant {mid} can't be tracked anymore as the target node is deleted")
         #continue
-
-    print(b)
-    print(mutant_value)
-    b = b[:dst_start_pos] + mutant_value + b[dst_end_pos + 1:]
-
-    print(b)
+    else:
+        print(b)
+        print(mutant_value)
+        b = b[:dst_start_pos] + mutant_value + b[dst_end_pos + 1:]
+        print(b)
