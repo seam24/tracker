@@ -5,6 +5,8 @@ import xml.etree.ElementTree as ET
 from typing import Dict, Optional, Union, Iterable
 import uuid
 
+
+# region Utils & Helpers
 class InvalidOutputError(Exception):
     """Raise invalid output error"""
     pass
@@ -186,7 +188,7 @@ def analyse_node_changes(
         except KeyError as e:
             raise type(e)("[PosNotExist] position does not exist in chr_to_line_src/dst") from e
         except TypeError as e:  # None
-            print(e)
+            #print(e)
             dst_pos, dst_end_pos = None, None
             dst_start_lno, dst_end_lno = None, None
         except ValueError as e:  # malformed attributes
@@ -211,42 +213,220 @@ def analyse_node_changes(
 
 
 def diff(a:str,b:str, lang:str=".py",target_only_mths:bool = True):
+    """
+    Compute an AST-based diff between two source code versions using GumTree.
+
+    This function runs GumTree (inside Docker) to compare two code strings and
+    returns a structured mapping of changed AST nodes (positions, line numbers,
+    and metadata). It’s typically used as a building block for tracking mutants
+    or other fine-grained code changes between file revisions.
+
+    Parameters
+    ----------
+    a : str
+        The first version of the source code (e.g., "old" version).
+    b : str
+        The second version of the source code (e.g., "new" version).
+    lang : str, optional
+        Programming language extension to inform GumTree’s parser (default ".py").
+        Examples: ".py", ".java", ".c".
+    target_only_mths : bool, optional
+        If True (default), the function is intended to focus only on method-level
+        changes but currently raises `NotImplementedError` since that analysis
+        isn’t implemented yet.
+        If False, the function analyzes and returns all changed AST nodes.
+
+    Returns
+    -------
+    dict
+        A mapping of changed nodes when `target_only_mths` is False.
+        Keys are `"start-end"` character position ranges from the source version `a`.
+        Values are dictionaries with details such as:
+            - type (str): AST node type.
+            - label (str or None): Identifier or label of the node.
+            - src_start_pos, src_end_pos (int): Character positions in `a`.
+            - dst_start_pos, dst_end_pos (int or None): Character positions in `b`.
+            - src_start_lno, src_end_lno (int): Line numbers in `a`.
+            - dst_start_lno, dst_end_lno (int or None): Line numbers in `b`.
+
+    Raises
+    ------
+    NotImplementedError
+        If `target_only_mths` is True (method-level diffing not implemented).
+    RuntimeError
+        If the underlying GumTree process fails.
+
+    Notes
+    -----
+    - Internally calls `gumdiff()` to run GumTree’s `axmldiff` command.
+    - Designed to be a helper for higher-level mutant tracking (e.g., `mu_map()`).
+    """
     diff_out=gumdiff(a,b,lang,commands=["axmldiff"])
-    #print(diff_out)
     if target_only_mths:
         raise NotImplementedError("analyse_mth_changes method has not been implemented!")
     else:
         ret = analyse_node_changes(diff_out, content_src=a, content_dst=b)
     return ret
 
-if __name__ == "__main__":
-    with open("tests/a.py",'r') as f:
-        a = f.read()
-    with open("tests/b.py",'r') as f:
-        b = f.read()
-    updated_node_range=diff(a, b,".py",target_only_mths=False)
-    with open("tests/mu_a.py",'r') as f:mu_a = f.read()
-    mid=1
-    m_start_pos= 43
-    m_end_pos = 43
-    mutant_value="=="
-    m_pos_key = f"{m_start_pos}-{m_end_pos}"
-    tnode = updated_node_range.get(m_pos_key)
-    # for k in updated_node_range:
-    #     print(k,updated_node_range[k])
-    #     input()
-    # exit()
-    print(tnode)
+# endregion
+
+
+def map_mutant(src_from:str, src_to:str, mu_info_from:Dict, lang=".py", verbose=True):
+    """
+    Map (track) a mutant between two versions of source code using GumTree AST differencing.
+
+    This function lets you locate where a known mutation in one version of code
+    (e.g., an older file) corresponds in another version (e.g., a refactored or updated file)
+    — and vice versa. It’s useful when you want to keep mutant information aligned across
+    different code revisions.
+
+    Parameters
+    ----------
+    src_from : str
+        The source code where the mutant currently exists.
+    src_to : str
+        The other version of the source code where the mutant should be mapped.
+    mu_info_from : Dict
+        Metadata about the mutant to map. Expected keys:
+            - "mutant_id" (str): Identifier for the mutant.
+            - "mutation_start_pos" (int): Character index where the mutation starts in `src_from`.
+            - "mutation_end_pos" (int): Character index where the mutation ends in `src_from`.
+            - "mutant_value" (str): Replacement code/value to insert in the mapped version.
+    lang : str, optional
+        Programming language extension used by GumTree (default ".py").
+    verbose : bool, optional
+        If True, logs messages about unmappable or deleted nodes (default True).
+
+    Returns
+    -------
+    str or None
+        Updated code with the mutant applied at the mapped location, or None if the
+        corresponding node was deleted and cannot be mapped.
+
+    Raises
+    ------
+    MutTrackFailureError
+        If the mutant’s original position cannot be mapped to any node.
+
+    Notes
+    -----
+    - Internally, this function calls `diff()` which runs GumTree in Docker to compute
+      AST differences and find node position mappings.
+    - Works for both directions: old → new or new → old.
+    """
+    updated_node_range = diff(src_from, src_to, lang, target_only_mths=False)
+    mutant_pos_key = f"{mu_info_from['mutation_start_pos']}-{mu_info_from['mutation_end_pos']}"
+    tnode = updated_node_range.get(mutant_pos_key)
     if tnode is None:  # does not exist
-        raise MutTrackFailureError(f"[Mutant-Track] failed to find the mutant {mid} at {m_pos_key}")
+       raise MutTrackFailureError(
+           f"[Mutant-Track] failed to find the mutant {mu_info_from['mutant_id']} at {mutant_pos_key}")
+
     # replace
     dst_start_pos, dst_end_pos = tnode['dst_start_pos'], tnode['dst_end_pos']
     if dst_start_pos is None:  # deleted
-        #TODO: UPDATE KEEP TRACK
-        print(f"[Log] mutant {mid} can't be tracked anymore as the target node is deleted")
-        #continue
+        # TODO: UPDATE KEEP TRACK | TRANSFER THAT RESPONSIBILITY TO SOME OTHER PART OF THE CODE
+        if verbose: print(f"[Log] mutant {mu_info_from['mutant_id']} can't be tracked anymore as the target node is deleted")
     else:
-        print(b)
-        print(mutant_value)
-        b = b[:dst_start_pos] + mutant_value + b[dst_end_pos + 1:]
-        print(b)
+        mapped_mutant = src_to[:dst_start_pos] + mu_info_from["mutant_value"] + src_to[dst_end_pos + 1:]
+        return mapped_mutant
+
+
+
+def test_case1():
+    src_from = """
+    import os
+    import numpy
+
+    def f():
+     x=2
+     if x>2:
+       print(x*x)
+     else:
+       x+=3
+       print(x+x)
+    """
+
+    # converting if x>2 to x==2
+    mu_info_from = {"mutant_id": "1", "mutation_start_pos": 64, "mutation_end_pos": 64, "mutant_value": "=="}
+
+    src_to = """
+    import os
+    import numpy
+
+    def func():
+      y=2
+      if y>2:
+        print(y*y)
+      else:
+        x=2
+        y+=x
+        print(y+y-1)
+    """
+
+    mapped_mutants=map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
+
+    expected_mutant = """
+    import os
+    import numpy
+
+    def func():
+      y=2
+      if y==2:
+        print(y*y)
+      else:
+        x=2
+        y+=x
+        print(y+y-1)
+    """
+
+    assert mapped_mutants==expected_mutant
+
+def test_case2():
+    src_from = """
+    import os
+    import numpy
+
+    def f():
+     x=2
+     if x>2:
+       print(x*x)
+     else:
+       x+=3
+       print(x+x)
+    """
+
+    # converting if x>2 to x==2
+    mu_info_from = {"mutant_id": "1", "mutation_start_pos": 64, "mutation_end_pos": 64, "mutant_value": "=="}
+
+    src_to = """
+    import os
+    import numpy
+
+    def func():
+      y=2
+      if y>2 and y<y+3:
+        print(y*y)
+      else:
+        x=2
+        y+=x
+        print(y+y-1)
+    """
+
+    mapped_mutants= map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
+
+    expected_mutant = """
+    import os
+    import numpy
+
+    def func():
+      y=2
+      if y==2 and y<y+3:
+        print(y*y)
+      else:
+        x=2
+        y+=x
+        print(y+y-1)
+    """
+
+    assert mapped_mutants==expected_mutant
+
