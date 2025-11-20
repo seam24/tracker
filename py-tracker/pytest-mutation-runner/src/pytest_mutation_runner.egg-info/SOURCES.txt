@@ -1,0 +1,9 @@
+pyproject.toml
+src/pytest_mutation_runner/__init__.py
+src/pytest_mutation_runner/plugin.py
+src/pytest_mutation_runner.egg-info/PKG-INFO
+src/pytest_mutation_runner.egg-info/SOURCES.txt
+src/pytest_mutation_runner.egg-info/dependency_links.txt
+src/pytest_mutation_runner.egg-info/entry_points.txt
+src/pytest_mutation_runner.egg-info/requires.txt
+src/pytest_mutation_runner.egg-info/top_level.txt

@@ -1,0 +1,2 @@
+[pytest11]
+mutation_runner = pytest_mutation_runner.plugin
