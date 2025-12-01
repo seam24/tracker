@@ -2,7 +2,7 @@ import subprocess
 import tempfile
 import os
 import xml.etree.ElementTree as ET
-from typing import Dict, Optional, Union, Iterable
+from typing import Dict, Optional, Union, Iterable, Tuple
 import uuid
 
 
@@ -271,64 +271,52 @@ def diff(a:str,b:str, lang:str=".py",target_only_mths:bool = True):
 # endregion
 
 
-def map_mutant(src_from:str, src_to:str, mu_info_from:Dict, lang=".py", verbose=True):
+def map_mutant(
+    src_from: str,
+    src_to: str,
+    mu_info_from: Dict,
+    lang: str = ".py",
+    verbose: bool = True,
+) -> Tuple[Optional[str], Optional[int], Optional[int]]:
     """
-    Map (track) a mutant between two versions of source code using GumTree AST differencing.
-
-    This function lets you locate where a known mutation in one version of code
-    (e.g., an older file) corresponds in another version (e.g., a refactored or updated file)
-    — and vice versa. It’s useful when you want to keep mutant information aligned across
-    different code revisions.
-
-    Parameters
-    ----------
-    src_from : str
-        The source code where the mutant currently exists.
-    src_to : str
-        The other version of the source code where the mutant should be mapped.
-    mu_info_from : Dict
-        Metadata about the mutant to map. Expected keys:
-            - "mutant_id" (str): Identifier for the mutant.
-            - "mutation_start_pos" (int): Character index where the mutation starts in `src_from`.
-            - "mutation_end_pos" (int): Character index where the mutation ends in `src_from`.
-            - "mutant_value" (str): Replacement code/value to insert in the mapped version.
-    lang : str, optional
-        Programming language extension used by GumTree (default ".py").
-    verbose : bool, optional
-        If True, logs messages about unmappable or deleted nodes (default True).
-
     Returns
     -------
-    str or None
-        Updated code with the mutant applied at the mapped location, or None if the
-        corresponding node was deleted and cannot be mapped.
+    (mapped_mutant, new_start_pos, new_end_pos)
 
-    Raises
-    ------
-    MutTrackFailureError
-        If the mutant’s original position cannot be mapped to any node.
-
-    Notes
-    -----
-    - Internally, this function calls `diff()` which runs GumTree in Docker to compute
-      AST differences and find node position mappings.
-    - Works for both directions: old → new or new → old.
+    - mapped_mutant: mutated version of `src_to` with the mutant applied, or None if
+      the node was deleted / cannot be tracked.
+    - new_start_pos: inclusive start index of the mutant in mapped_mutant (using code_mutate convention), or None.
+    - new_end_pos:  end index of the mutant in mapped_mutant (using code_mutate convention), or None.
     """
     updated_node_range = diff(src_from, src_to, lang, target_only_mths=False)
     mutant_pos_key = f"{mu_info_from['mutation_start_pos']}-{mu_info_from['mutation_end_pos']}"
     tnode = updated_node_range.get(mutant_pos_key)
     if tnode is None:  # does not exist
-       raise MutTrackFailureError(
-           f"[Mutant-Track] failed to find the mutant {mu_info_from['mutant_id']} at {mutant_pos_key}")
+        raise MutTrackFailureError(
+            f"[Mutant-Track] failed to find the mutant {mu_info_from['mutant_id']} at {mutant_pos_key}"
+        )
 
-    # replace
-    dst_start_pos, dst_end_pos = tnode['dst_start_pos'], tnode['dst_end_pos']
+    dst_start_pos, dst_end_pos = tnode["dst_start_pos"], tnode["dst_end_pos"]
+
     if dst_start_pos is None:  # deleted
-        # TODO: UPDATE KEEP TRACK | TRANSFER THAT RESPONSIBILITY TO SOME OTHER PART OF THE CODE
-        if verbose: print(f"[Log] mutant {mu_info_from['mutant_id']} can't be tracked anymore as the target node is deleted")
-    else:
-        mapped_mutant = src_to[:dst_start_pos] + mu_info_from["mutant_value"] + src_to[dst_end_pos + 1:]
-        return mapped_mutant
+        if verbose:
+            print(
+                f"[Log] mutant {mu_info_from['mutant_id']} can't be tracked anymore "
+                f"as the target node is deleted"
+            )
+        # consistent 3-tuple
+        return None, None, None
+
+    mutant_value = mu_info_from["mutant_value"]
+
+    # Build mutated target source
+    mapped_mutant = src_to[:dst_start_pos] + mutant_value + src_to[dst_end_pos + 1 :]
+
+    # positions in the *mutated* code, using code_mutate convention
+    new_start_pos = dst_start_pos
+    new_end_pos = dst_end_pos + 1
+
+    return mapped_mutant, new_start_pos, new_end_pos
 
 
 
@@ -363,7 +351,7 @@ def test_case1():
         print(y+y-1)
     """
 
-    mapped_mutants=map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
+    mapped_mutants, new_start_pos, new_end_pos=map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
 
     expected_mutant = """
     import os
@@ -412,7 +400,7 @@ def test_case2():
         print(y+y-1)
     """
 
-    mapped_mutants= map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
+    mapped_mutants, new_start_pos, new_end_pos= map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
 
     expected_mutant = """
     import os
