@@ -289,12 +289,16 @@ def map_mutant(
     - new_end_pos:  end index of the mutant in mapped_mutant (using code_mutate convention), or None.
     """
     updated_node_range = diff(src_from, src_to, lang, target_only_mths=False)
-    mutant_pos_key = f"{mu_info_from['mutation_start_pos']}-{mu_info_from['mutation_end_pos']}"
+    mutant_pos_key = f"{mu_info_from['mutation_start_pos']}-{mu_info_from['mutation_end_pos']-1}"
+
     tnode = updated_node_range.get(mutant_pos_key)
     if tnode is None:  # does not exist
-        raise MutTrackFailureError(
-            f"[Mutant-Track] failed to find the mutant {mu_info_from['mutant_id']} at {mutant_pos_key}"
-        )
+        # raise MutTrackFailureError(
+        #     f"[Mutant-Track] failed to find the mutant {mu_info_from['mutant_id']} at {mutant_pos_key}"
+        # )
+        if verbose:
+            print(f"[Mutant-Track] failed to find the mutant {mu_info_from['mutant_id']} at {mutant_pos_key}")
+        return None, None, None
 
     dst_start_pos, dst_end_pos = tnode["dst_start_pos"], tnode["dst_end_pos"]
 
@@ -335,7 +339,7 @@ def test_case1():
     """
 
     # converting if x>2 to x==2
-    mu_info_from = {"mutant_id": "1", "mutation_start_pos": 64, "mutation_end_pos": 64, "mutant_value": "=="}
+    mu_info_from = {"mutant_id": "1", "mutation_start_pos": 64, "mutation_end_pos": 65, "mutant_value": "=="}
 
     src_to = """
     import os
@@ -384,7 +388,7 @@ def test_case2():
     """
 
     # converting if x>2 to x==2
-    mu_info_from = {"mutant_id": "1", "mutation_start_pos": 64, "mutation_end_pos": 64, "mutant_value": "=="}
+    mu_info_from = {"mutant_id": "1", "mutation_start_pos": 64, "mutation_end_pos": 65, "mutant_value": "=="}
 
     src_to = """
     import os
@@ -417,4 +421,3 @@ def test_case2():
     """
 
     assert mapped_mutants==expected_mutant
-
