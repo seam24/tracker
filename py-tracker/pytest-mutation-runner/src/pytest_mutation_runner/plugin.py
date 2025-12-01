@@ -173,7 +173,7 @@ def pytest_addoption(parser):
     parser.addoption(
         PROG_RES,
         action="store",
-        required=True,
+        required=False,
         default=None,
         help="Path to JSON file with per-test results (read or write depending on --mode).",
     )
@@ -189,7 +189,8 @@ def pytest_addoption(parser):
     parser.addoption(
         MODE,
         choices=["program", "mutant"],
-        required=True,
+        required=False,
+        default=None,
         help="Execution mode: 'program' to record original results, 'mutant' to compare outcomes.",
     )
     parser.addoption(
@@ -231,12 +232,26 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    mode = config.getoption(MODE)
 
-    if config.getoption(MODE) == "mutant":
-        plugin=MutantMode()
-    elif config.getoption(MODE) == "program":
+    # If no mode is given, completely disable this plugin’s functionality
+    if not mode:
+        # Do nothing: pytest behaves as if this plugin is not there
+        return
+
+    # If mode IS set, enforce that --program-results is provided
+    prog_res = config.getoption(PROG_RES)
+    if not prog_res:
+        raise pytest.UsageError(
+            f"{PROG_RES} must be provided when {MODE} is set "
+            "(e.g., --mode=program --program-results=path.json)"
+        )
+
+    if mode == "mutant":
+        plugin = MutantMode()
+    elif mode == "program":
         plugin = ProgramMode()
     else:
-        raise pytest.UsageError("Unknown --mode")
+        raise pytest.UsageError("Unknown --mode value")
 
     config.pluginmanager.register(plugin, "mutation_plugin")
