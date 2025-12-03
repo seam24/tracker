@@ -18,8 +18,6 @@ def parse_args():
                         help="Root directory of the project")
     parser.add_argument("--src-path", required=True,
                         help=".py file inside the project")
-    parser.add_argument("--tests", nargs="+", required=True,
-                        help="Test file(s) or directories")
     parser.add_argument("--prog-res", required=True,
                         help="JSON file with program execution results")
     parser.add_argument("--mutants", required=True,
@@ -27,6 +25,8 @@ def parse_args():
     parser.add_argument("--save-path", required=True,
                         help="Where to store mutant result files")
 
+    
+    parser.add_argument("--tests", nargs="+", required=False, help="Test file(s) or directories")
     parser.add_argument("--stop-on-kill", action="store_true", default=False)
     parser.add_argument("--timeout-min", type=float, default=None)
     parser.add_argument("--timeout-multiplier", type=float, default=None)
@@ -103,18 +103,19 @@ def resolve_paths(args):
 
     # Tests: resolve, if under base_repo then remember relative path
     test_paths = []
-    for t in args.tests:
-        p = Path(t).expanduser()
-        if not p.is_absolute():
-            p = (base_repo / p).resolve()
-        else:
-            p = p.resolve()
-        try:
-            rel = p.relative_to(base_repo)
-            test_paths.append(("in_repo", rel))
-        except ValueError:
-            # Outside repo; we’ll pass absolute path directly to pytest
-            test_paths.append(("external", p))
+    if args.tests:
+        for t in args.tests:
+            p = Path(t).expanduser()
+            if not p.is_absolute():
+                p = (base_repo / p).resolve()
+            else:
+                p = p.resolve()
+            try:
+                rel = p.relative_to(base_repo)
+                test_paths.append(("in_repo", rel))
+            except ValueError:
+                # Outside repo; we’ll pass absolute path directly to pytest
+                test_paths.append(("external", p))
 
     prog_res = Path(args.prog_res).expanduser().resolve()
     mutants = Path(args.mutants).expanduser().resolve()
