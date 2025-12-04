@@ -1,44 +1,65 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-import os
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run pytest for each mutant in a sandboxed copy of a repo."
+        description="Run pytest for each mutant in a sandboxed copy of a repo "
+                    "using a per-mutant file+span JSON format."
     )
 
-    # Required named args
-    parser.add_argument("--base-repo", required=True,
-                        help="Root directory of the project")
-    parser.add_argument("--src-path", required=True,
-                        help=".py file inside the project")
-    parser.add_argument("--prog-res", required=True,
-                        help="JSON file with program execution results")
-    parser.add_argument("--mutants", required=True,
-                        help="JSON file with mutants information")
-    parser.add_argument("--save-path", required=True,
-                        help="Where to store mutant result files")
+    parser.add_argument(
+        "--base-repo",
+        required=True,
+        help="Root directory of the project (git checkout for a specific commit).",
+    )
+    parser.add_argument(
+        "--tests",
+        nargs="+",
+        required=False,
+        help="Test file(s) or directories (relative to base-repo or absolute).",
+    )
+    parser.add_argument(
+        "--prog-res",
+        required=True,
+        help="JSON file with program execution results (input to pytest).",
+    )
+    parser.add_argument(
+        "--mutants",
+        required=True,
+        help="JSON file with mutants information (list of dicts).",
+    )
+    parser.add_argument(
+        "--save-path",
+        required=True,
+        help="Directory where mutant result files will be stored.",
+    )
 
-    
-    parser.add_argument("--tests", nargs="+", required=False, help="Test file(s) or directories")
+    # pytest / mutant options
     parser.add_argument("--stop-on-kill", action="store_true", default=False)
     parser.add_argument("--timeout-min", type=float, default=None)
     parser.add_argument("--timeout-multiplier", type=float, default=None)
     parser.add_argument("--disable-incompetent", action="store_true", default=False)
 
+    # partitioning
     parser.add_argument(
-        "--njobs",type=int,default=1,
-            help="Total number of jobs for partitioning mutants (default: 1)",
+        "--njobs",
+        type=int,
+        default=1,
+        help="Total number of jobs for partitioning mutants (default: 1)",
     )
     parser.add_argument(
-        "--jid",type=int,default=0,
-            help="Job id in [0, njobs-1] indicating which partition to run (default: 0)",
+        "--jid",
+        type=int,
+        default=0,
+        help="Job id in [0, njobs-1] indicating which partition to run (default: 0)",
     )
 
     parser.add_argument(
@@ -52,7 +73,7 @@ def parse_args():
         "--sandbox-mode",
         choices=["copy", "symlink"],
         default="copy",
-        help="Sandbox creation mode: 'copy' (default) or 'symlink'."
+        help="Sandbox creation mode: 'copy' (default) or 'symlink'.",
     )
 
     return parser.parse_args()
@@ -80,26 +101,14 @@ def compute_partition_indices(total: int, njobs: int, jid: int):
 
     return start, end
 
+
 def resolve_paths(args):
     """
     Resolve paths before we chdir into the sandbox.
     """
     base_repo = Path(args.base_repo).expanduser().resolve()
-
     if not base_repo.is_dir():
         raise SystemExit(f"base_repo does not exist or is not a directory: {base_repo}")
-
-    # src_path must be inside base_repo
-    src_path = Path(args.src_path).expanduser()
-    if not src_path.is_absolute():
-        src_path = (base_repo / src_path).resolve()
-    else:
-        src_path = src_path.resolve()
-
-    try:
-        relative_src = src_path.relative_to(base_repo)
-    except ValueError:
-        raise SystemExit(f"src_path must be inside base_repo.\n  base_repo: {base_repo}\n  src_path: {src_path}")
 
     # Tests: resolve, if under base_repo then remember relative path
     test_paths = []
@@ -123,8 +132,6 @@ def resolve_paths(args):
 
     return {
         "base_repo": base_repo,
-        "src_path": src_path,
-        "relative_src": relative_src,
         "test_paths": test_paths,
         "prog_res": prog_res,
         "mutants": mutants,
@@ -132,36 +139,38 @@ def resolve_paths(args):
     }
 
 
-def load_src_code(src_path: Path) -> str:
-    return src_path.read_text(encoding="utf-8")
-
-
 def load_mutants(mutants_path: Path):
+    """
+    Expect a list of dicts, each with at least:
+      - file: path inside the repo (e.g. 'cookiecutter/hooks.py')
+      - start_pos, end_pos: integer positions in the original source
+      - mutant_value: string replacement
+    Optionally:
+      - mutant_id: integer or string identifier
+
+    We normalize so each mutant has:
+      - 'id': used as the mutant identifier
+    """
     with mutants_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Accept either a dict or a list
-    if isinstance(data, dict):
-        # iterate as (key, value)
-        iterable = []
-        for k, v in data.items():
-            # store id key if not present
-            if isinstance(v, dict) and "id" not in v:
-                v = dict(v)
-                v["id"] = k
-            iterable.append(v)
-        return iterable
-    elif isinstance(data, list):
-        # ensure each mutant has an id
-        result = []
-        for i, mu in enumerate(data):
-            if isinstance(mu, dict) and "id" not in mu:
-                mu = dict(mu)
-                mu["id"] = mu.get("mutant_id", i)
-            result.append(mu)
-        return result
-    else:
-        raise SystemExit("mutants JSON must be a list or dict")
+    if not isinstance(data, list):
+        raise SystemExit("mutants JSON must be a list of mutant objects")
+
+    result = []
+    for i, mu in enumerate(data):
+        if not isinstance(mu, dict):
+            raise SystemExit(f"Mutant at index {i} is not an object: {mu!r}")
+        mu = dict(mu)
+        if "id" not in mu:
+            mu["id"] = mu.get("mutant_id", i)
+        # sanity check for required fields
+        for field in ("file", "start_pos", "end_pos", "mutant_value"):
+            if field not in mu:
+                raise SystemExit(f"Mutant {mu['id']} missing required field '{field}'")
+        result.append(mu)
+
+    return result
 
 
 def reconstruct_mutant_code(original_src: str, mutant_info: dict) -> str:
@@ -187,7 +196,7 @@ def build_pytest_command(
         else:
             cmd.append(str(p))
 
-    # Custom options
+    # Custom options for your pytest plugin
     cmd.extend(["--mode", "mutant"])
     cmd.extend(["--program-results", str(prog_res)])
 
@@ -211,7 +220,6 @@ def main():
 
     paths["save_path"].mkdir(parents=True, exist_ok=True)
 
-    original_src = load_src_code(paths["src_path"])
     mutants = load_mutants(paths["mutants"])
 
     # --- Mutant ID mode (overrides parallel partitioning entirely) ---
@@ -248,16 +256,17 @@ def main():
         print(f"njobs={args.njobs}, jid={args.jid}")
         print(f"Processing slice [{start_idx}, {end_idx}) -> {len(job_mutants)} mutants\n")
 
-    # Nothing left to run
     if not job_mutants:
         print("This job has no mutants to process. Exiting.")
         return
+
+    # Cache original source per file (relative to repo root)
+    original_code_cache = {}
 
     # Create sandbox as a full copy of the repo
     with tempfile.TemporaryDirectory(prefix="mutant-sandbox-") as tmpdir:
         sandbox_root = Path(tmpdir)
 
-        # creating the sandbox
         if args.sandbox_mode == "copy":
             shutil.copytree(paths["base_repo"], sandbox_root, dirs_exist_ok=True)
         elif args.sandbox_mode == "symlink":
@@ -268,33 +277,40 @@ def main():
                 dirs_exist_ok=True,
             )
 
-        sandbox_src_path = sandbox_root / paths["relative_src"]
-
-        if not sandbox_src_path.exists():
-            raise SystemExit(
-                f"Sandbox source path does not exist after copy: {sandbox_src_path}"
-            )
-
         #################################################################
         # Main mutation/testing loop
         #################################################################
-
         for local_idx, mu in enumerate(job_mutants):
             global_idx = start_idx + local_idx
             mu_id = mu.get("id", global_idx)
+
+            rel_file = Path(mu["file"])  # path inside repo, e.g. "cookiecutter/hooks.py"
+            sandbox_src_path = sandbox_root / rel_file
+
+            if not sandbox_src_path.exists():
+                raise SystemExit(
+                    f"Sandbox source path for mutant {mu_id} does not exist: {sandbox_src_path}"
+                )
+
+            # Load and cache original code for this file once
+            key = rel_file.as_posix()
+            if key not in original_code_cache:
+                original_code_cache[key] = sandbox_src_path.read_text(encoding="utf-8")
+            original_src = original_code_cache[key]
+
             print(
                 f"=== [jid={args.jid}] Running mutant {mu_id} "
                 f"(global {global_idx + 1}/{total_mutants}, "
                 f"job {local_idx + 1}/{len(job_mutants)}) ==="
             )
+            print(f"  File: {rel_file}")
 
-            # Reconstruct mutant code
+            # Construct mutant code from original source
             mutant_code = reconstruct_mutant_code(original_src, mu)
 
             # Break symlink safely, then write mutated file only in sandbox
             if sandbox_src_path.is_symlink():
                 sandbox_src_path.unlink()
-            # Write mutant into sandbox
             sandbox_src_path.write_text(mutant_code, encoding="utf-8")
 
             # Where to save results for this mutant
@@ -324,21 +340,10 @@ def main():
                     file=sys.stderr,
                 )
 
-            # NOTE:
-            # We do NOT restore here.
-            # This is fine as long as all mutants target the same file and we always
-            # overwrite it with the next mutant.
-            # If in the future mutants can target different files, we'll want to:
-            #   1) track the original content per file, and
-            #   2) restore only the file that was mutated or needed.
-
-            # Break symlink safely, then write mutated file only in sandbox
-            # if sandbox_src_path.is_symlink():
-            #     sandbox_src_path.unlink()
-            # sandbox_src_path.write_text(original_src, encoding="utf-8")
+            # We do not need to restore the file: on the next mutant for this file,
+            # we always rebuild from original_code_cache[key].
 
     print("Done.")
-
 
 
 if __name__ == "__main__":
