@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import shutil
 import subprocess
 import tempfile
@@ -11,20 +12,35 @@ from pathlib import Path
 from git import Repo, Commit
 
 
-def run_allow_fail(cmd, cwd=None, log_file: Path | None = None) -> int:
+def run_allow_fail(
+    cmd: list[str],
+    cwd: str | Path | None = None,
+    log_file: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> int:
     """
     Run a command, but do NOT raise if it fails.
     If log_file is given, capture stdout+stderr into that file.
+    If env is given, use that environment (e.g., to override HOME).
     Return the exit code.
     """
     print(f"+ (cwd={cwd}) {' '.join(cmd)}")
 
+    if cwd is not None:
+        cwd = str(cwd)
+
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("w", encoding="utf-8") as f:
-            proc = subprocess.run(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT)
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                env=env,
+            )
     else:
-        proc = subprocess.run(cmd, cwd=cwd)
+        proc = subprocess.run(cmd, cwd=cwd, env=env)
 
     if proc.returncode != 0:
         print(f"!! Command exited with code {proc.returncode}, continuing.")
@@ -206,7 +222,10 @@ def main() -> None:
     results_root = Path(args.results_dir).resolve()
     results_root.mkdir(parents=True, exist_ok=True)
     print(f"+ Results will be saved under: {results_root}")
-    print(f"+ cores={args.cores}, jid={args.jid}, pkg_name={args.pkg_name}, conda_env={args.conda_env}")
+    print(
+        f"+ cores={args.cores}, jid={args.jid}, "
+        f"pkg_name={args.pkg_name}, conda_env={args.conda_env}"
+    )
 
     commits = get_commits_since(repo, args.days)
     if not commits:
@@ -239,6 +258,13 @@ def main() -> None:
     work_dir = tmp_root / "work"
     print(f"+ Using temp root directory: {tmp_root}")
 
+    # Per-job HOME to isolate cookiecutter replay dir and similar state
+    home_dir = tmp_root / "home"
+    home_dir.mkdir(parents=True, exist_ok=True)
+    env_base = os.environ.copy()
+    env_base["HOME"] = str(home_dir)
+    print(f"+ Using isolated HOME for this job: {home_dir}")
+
     parallel_mode = (args.pkg_name is None and args.cores > 1)
 
     # Helper to optionally prepend "conda run -n <env>".
@@ -252,7 +278,8 @@ def main() -> None:
         if args.pkg_name:
             print(f"+ Safety: uninstalling {args.pkg_name} BEFORE loop")
             run_allow_fail(
-                wrap_cmd(["pip", "uninstall", "-y", args.pkg_name])
+                wrap_cmd(["pip", "uninstall", "-y", args.pkg_name]),
+                env=env_base,
             )
 
         for global_idx in selected_indices:
@@ -272,7 +299,10 @@ def main() -> None:
                 # PARALLEL MODE (no git worktree)
                 if is_head_global:
                     # Only one job will see global_idx == 0 → safe
-                    print("+ Parallel HEAD iteration → copying current repo_root (incl. uncommitted) into work_dir.")
+                    print(
+                        "+ Parallel HEAD iteration → copying current repo_root "
+                        "(incl. uncommitted) into work_dir."
+                    )
                     shutil.copytree(repo_root, work_dir)
                 else:
                     print("+ Parallel mode → using git archive to populate work_dir.")
@@ -280,7 +310,10 @@ def main() -> None:
             else:
                 # SEQUENTIAL MODE (old semantics with worktree)
                 if is_head_global:
-                    print("+ HEAD iteration → copying current repo_root (incl. uncommitted) into work_dir.")
+                    print(
+                        "+ HEAD iteration → copying current repo_root "
+                        "(incl. uncommitted) into work_dir."
+                    )
                     shutil.copytree(repo_root, work_dir)
                 else:
                     print("+ Using git worktree add for this commit (via GitPython).")
@@ -294,25 +327,34 @@ def main() -> None:
             if args.pkg_name is not None:
                 pip_install_cmd = wrap_cmd(["pip", "install", "-e", "."])
                 print("+ Running pip install -e .")
-                run_allow_fail(pip_install_cmd, cwd=work_dir)
+                run_allow_fail(pip_install_cmd, cwd=work_dir, env=env_base)
 
             # Run pytest, logging output (always)
-            pytest_cmd = wrap_cmd([
-                "pytest",
-                "--mode",
-                "program",
-                "--program-results",
-                str(result_file),
-            ])
+            pytest_cmd = wrap_cmd(
+                [
+                    "pytest",
+                    "--mode",
+                    "program",
+                    "--program-results",
+                    str(result_file),
+                ]
+            )
 
-            exit_code = run_allow_fail(pytest_cmd, cwd=work_dir, log_file=log_file)
+            exit_code = run_allow_fail(
+                pytest_cmd,
+                cwd=work_dir,
+                log_file=log_file,
+                env=env_base,
+            )
             print(f"+ pytest exit code for {commit.hexsha}: {exit_code}")
             print(f"+ pytest log for {commit.hexsha} saved to: {log_file}")
 
             if args.pkg_name is not None:
-                pip_uninstall_cmd = wrap_cmd(["pip", "uninstall", "-y", args.pkg_name])
+                pip_uninstall_cmd = wrap_cmd(
+                    ["pip", "uninstall", "-y", args.pkg_name]
+                )
                 print(f"+ Uninstalling package {args.pkg_name} from environment")
-                run_allow_fail(pip_uninstall_cmd, cwd=work_dir)
+                run_allow_fail(pip_uninstall_cmd, cwd=work_dir, env=env_base)
 
             if not parallel_mode and not is_head_global:
                 # Only sequential mode uses worktrees
@@ -327,7 +369,8 @@ def main() -> None:
         if args.pkg_name:
             print(f"+ Safety: uninstalling {args.pkg_name} AFTER loop")
             run_allow_fail(
-                wrap_cmd(["pip", "uninstall", "-y", args.pkg_name])
+                wrap_cmd(["pip", "uninstall", "-y", args.pkg_name]),
+                env=env_base,
             )
 
         print(f"\n+ Cleaning up temp root directory: {tmp_root}")
