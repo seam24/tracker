@@ -139,14 +139,18 @@ def main() -> None:
     parser.add_argument(
         "--conda-env",
         type=str,
-        required=True,
-        help="Name of the conda environment to use.",
+        default=None,
+        help=(
+            "Optional name of the conda environment to use. "
+            "If provided, commands are run as "
+            "'conda run -n <env> ...'. If omitted, the script "
+            "invokes 'pytest'/'pip' directly in the current environment."
+        ),
     )
 
-    # Running pip install/uninstall concurrently from
-    # multiple processes will CORRUPT the conda environment.
+    # Running pip install/uninstall concurrently from multiple processes
+    # can corrupt the environment (conda or otherwise).
     # Therefore: if --pkg-name is provided, only sequential mode is allowed.
-
     parser.add_argument(
         "--pkg-name",
         type=str,
@@ -202,7 +206,7 @@ def main() -> None:
     results_root = Path(args.results_dir).resolve()
     results_root.mkdir(parents=True, exist_ok=True)
     print(f"+ Results will be saved under: {results_root}")
-    print(f"+ cores={args.cores}, jid={args.jid}, pkg_name={args.pkg_name}")
+    print(f"+ cores={args.cores}, jid={args.jid}, pkg_name={args.pkg_name}, conda_env={args.conda_env}")
 
     commits = get_commits_since(repo, args.days)
     if not commits:
@@ -237,12 +241,18 @@ def main() -> None:
 
     parallel_mode = (args.pkg_name is None and args.cores > 1)
 
+    # Helper to optionally prepend "conda run -n <env>".
+    def wrap_cmd(inner: list[str]) -> list[str]:
+        if args.conda_env:
+            return ["conda", "run", "-n", args.conda_env] + inner
+        return inner
+
     try:
         # Safety uninstall before loop if pkg_name is provided (sequential pip mode)
         if args.pkg_name:
             print(f"+ Safety: uninstalling {args.pkg_name} BEFORE loop")
             run_allow_fail(
-                ["conda", "run", "-n", args.conda_env, "pip", "uninstall", "-y", args.pkg_name]
+                wrap_cmd(["pip", "uninstall", "-y", args.pkg_name])
             )
 
         for global_idx in selected_indices:
@@ -282,48 +292,26 @@ def main() -> None:
 
             # If pkg_name is provided → do per-commit pip install/uninstall (sequential only)
             if args.pkg_name is not None:
-                pip_install_cmd = [
-                    "conda",
-                    "run",
-                    "-n",
-                    args.conda_env,
-                    "pip",
-                    "install",
-                    "-e",
-                    ".",
-                ]
+                pip_install_cmd = wrap_cmd(["pip", "install", "-e", "."])
                 print("+ Running pip install -e .")
                 run_allow_fail(pip_install_cmd, cwd=work_dir)
 
             # Run pytest, logging output (always)
-            pytest_cmd = [
-                "conda",
-                "run",
-                "-n",
-                args.conda_env,
+            pytest_cmd = wrap_cmd([
                 "pytest",
                 "--mode",
                 "program",
                 "--program-results",
                 str(result_file),
-            ]
+            ])
 
             exit_code = run_allow_fail(pytest_cmd, cwd=work_dir, log_file=log_file)
             print(f"+ pytest exit code for {commit.hexsha}: {exit_code}")
             print(f"+ pytest log for {commit.hexsha} saved to: {log_file}")
 
             if args.pkg_name is not None:
-                pip_uninstall_cmd = [
-                    "conda",
-                    "run",
-                    "-n",
-                    args.conda_env,
-                    "pip",
-                    "uninstall",
-                    "-y",
-                    args.pkg_name,
-                ]
-                print(f"+ Uninstalling package {args.pkg_name} from env {args.conda_env}")
+                pip_uninstall_cmd = wrap_cmd(["pip", "uninstall", "-y", args.pkg_name])
+                print(f"+ Uninstalling package {args.pkg_name} from environment")
                 run_allow_fail(pip_uninstall_cmd, cwd=work_dir)
 
             if not parallel_mode and not is_head_global:
@@ -339,7 +327,7 @@ def main() -> None:
         if args.pkg_name:
             print(f"+ Safety: uninstalling {args.pkg_name} AFTER loop")
             run_allow_fail(
-                ["conda", "run", "-n", args.conda_env, "pip", "uninstall", "-y", args.pkg_name]
+                wrap_cmd(["pip", "uninstall", "-y", args.pkg_name])
             )
 
         print(f"\n+ Cleaning up temp root directory: {tmp_root}")
