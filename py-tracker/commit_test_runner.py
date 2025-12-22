@@ -32,6 +32,7 @@ def compute_partition_indices(total, njobs, jid):
 
     return start, end
 
+
 def run_allow_fail(cmd, cwd=None, log_file=None, env=None) -> int:
     print(f"+ (cwd={cwd}) {' '.join(cmd)}")
     if cwd is not None:
@@ -130,6 +131,7 @@ class BaseCommitRunner:
         use_head: bool,
         sandbox_mode: str,
         test_paths: list[str] | None,
+        ignore_paths: list[str] | None,
     ):
         self.repo_root = repo_root
         self.commit = commit
@@ -139,6 +141,7 @@ class BaseCommitRunner:
         self.use_head = use_head
         self.sandbox_mode = sandbox_mode
         self.test_paths = list(test_paths) if test_paths else []
+        self.ignore_paths = list(ignore_paths) if ignore_paths else []
 
         # Sandbox
         self.tmp_root = Path(tempfile.mkdtemp(prefix="sandbox-"))
@@ -184,7 +187,10 @@ class BaseCommitRunner:
         )
 
     def conda_pytest(self, args, cwd=None, log_file=None):
-        cmd = ["conda", "run", "-n", self.conda_env, "pytest"] + self.test_paths + args
+        ignore_args = []
+        for p in self.ignore_paths:
+            ignore_args += ["--ignore", p]
+        cmd = ["conda", "run", "-n", self.conda_env, "pytest"] + ignore_args + self.test_paths + args
         return run_allow_fail(cmd, cwd=cwd, env=self.env, log_file=log_file)
 
     def cleanup(self):
@@ -333,6 +339,11 @@ def parse_args():
 
     p.add_argument("--tests", nargs="*", default=[])
 
+    # Match pytest's flag name; allow repeated use:
+    #   --ignore path1 --ignore path2 ...
+    p.add_argument("--ignore", action="append", default=[],
+                   help="Paths to ignore (passed through to pytest as --ignore)")
+
     p.add_argument("--sandbox-mode", choices=["archive", "copy", "symlink"], default="archive")
     p.add_argument("--use-head", action="store_true")
 
@@ -347,7 +358,6 @@ def parse_args():
 
     p.add_argument("--njobs", type=int, default=1, help="Parallel jobs for mutant mode")
     p.add_argument("--jid", type=int, default=0, help="Job index for mutant mode")
-
 
     return p.parse_args()
 
@@ -398,6 +408,7 @@ if __name__ == "__main__":
             use_head=args.use_head,
             sandbox_mode=args.sandbox_mode,
             test_paths=args.tests,
+            ignore_paths=args.ignore,
         )
         prog.run()
 
@@ -405,7 +416,6 @@ if __name__ == "__main__":
     # Run MUTANT mode
     # -------------------------------
     if args.run in ("mutant", "both"):
-        # If running only program mode, we ignore njobs/jid.
         njobs = max(1, args.njobs)
         jid = args.jid
 
@@ -425,6 +435,7 @@ if __name__ == "__main__":
             use_head=args.use_head,
             sandbox_mode=args.sandbox_mode,
             test_paths=args.tests,
+            ignore_paths=args.ignore,
         )
 
         # Use existing program result file (from this run or previous)
