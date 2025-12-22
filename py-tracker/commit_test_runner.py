@@ -148,12 +148,33 @@ class BaseCommitRunner:
         self.work_dir = self.tmp_root / "work"
         self.home_dir = self.tmp_root / "home"
 
+        # Extra cache dirs inside sandbox
+        self.cache_dir = self.tmp_root / "cache"
+        self.pycache_dir = self.tmp_root / "pycache"
+        self.pytest_basetemp_root = self.tmp_root / "pytest_basetemp"
+
         self.env = os.environ.copy()
 
     def prepare_environment(self):
         self.home_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.pycache_dir.mkdir(parents=True, exist_ok=True)
+        self.pytest_basetemp_root.mkdir(parents=True, exist_ok=True)
+
+        # Isolate HOME (already good)
         self.env["HOME"] = str(self.home_dir)
+
+        # Keep common caches inside sandbox
+        self.env["XDG_CACHE_HOME"] = str(self.cache_dir)
+
+        # Make python bytecode deterministic / isolated
+        # If you prefer allowing pyc, remove PYTHONDONTWRITEBYTECODE
+        self.env["PYTHONDONTWRITEBYTECODE"] = "1"
+        self.env["PYTHONPYCACHEPREFIX"] = str(self.pycache_dir)
+
         print(f"+ Isolated HOME: {self.home_dir}")
+        print(f"+ Isolated XDG_CACHE_HOME: {self.cache_dir}")
+        print(f"+ Isolated PYTHONPYCACHEPREFIX: {self.pycache_dir}")
 
     def uninstall_package(self):
         if not self.pkg_name:
@@ -186,11 +207,77 @@ class BaseCommitRunner:
             env=self.env,
         )
 
-    def conda_pytest(self, args, cwd=None, log_file=None):
+    # ----------------------------
+    # Cache nuking (best effort)
+    # ----------------------------
+    def _rm_tree(self, p: Path):
+        try:
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    def clear_workdir_caches(self):
+        """
+        Clear caches inside the checked-out work tree.
+        This is important because you run pytest repeatedly in the SAME work_dir
+        (especially in mutant mode).
+        """
+        if not self.work_dir.exists():
+            return
+
+        # pytest cache
+        self._rm_tree(self.work_dir / ".pytest_cache")
+
+        # python caches inside work tree (if any were created)
+        for d in self.work_dir.rglob("__pycache__"):
+            self._rm_tree(d)
+
+        # stray .pyc files
+        for f in self.work_dir.rglob("*.pyc"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    def clear_global_sandbox_caches(self):
+        """
+        Clear caches under sandbox dirs (not strictly necessary each time,
+        but useful if some tool writes there).
+        """
+        self._rm_tree(self.cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self._rm_tree(self.pycache_dir)
+        self.pycache_dir.mkdir(parents=True, exist_ok=True)
+
+        # basetemp root; recreate
+        self._rm_tree(self.pytest_basetemp_root)
+        self.pytest_basetemp_root.mkdir(parents=True, exist_ok=True)
+
+    def conda_pytest(self, args, cwd=None, log_file=None, run_tag: str = "run"):
+        """
+        Run pytest with aggressive cache-clearing and unique basetemp.
+        """
+        # Clear caches that might affect outcomes between runs
+        self.clear_workdir_caches()
+
+        # Unique basetemp for this specific pytest invocation
+        basetemp = self.pytest_basetemp_root / run_tag
+        if basetemp.exists():
+            shutil.rmtree(basetemp, ignore_errors=True)
+        basetemp.mkdir(parents=True, exist_ok=True)
+
         ignore_args = []
         for p in self.ignore_paths:
             ignore_args += ["--ignore", p]
-        cmd = ["conda", "run", "-n", self.conda_env, "pytest"] + ignore_args + self.test_paths + args
+
+        # Force pytest to clear its own cache as well
+        forced = ["--cache-clear", "--basetemp", str(basetemp)]
+
+        cmd = ["conda", "run", "-n", self.conda_env, "pytest"] + forced + ignore_args + self.test_paths + args
         return run_allow_fail(cmd, cwd=cwd, env=self.env, log_file=log_file)
 
     def cleanup(self):
@@ -210,7 +297,7 @@ class ProgramCommitRunner(BaseCommitRunner):
         self.program_results_path = out_json
 
         args = ["--mode", "program", "--program-results", str(out_json)]
-        self.conda_pytest(args, cwd=self.work_dir, log_file=out_log)
+        self.conda_pytest(args, cwd=self.work_dir, log_file=out_log, run_tag=f"program-{self.commit}")
 
     def run(self):
         try:
@@ -218,6 +305,10 @@ class ProgramCommitRunner(BaseCommitRunner):
             self.uninstall_package()
             self.checkout()
             self.install_package()
+
+            # optional: also clear sandbox-level caches once before the run
+            self.clear_global_sandbox_caches()
+
             self.run_program_tests()
         finally:
             self.cleanup()
@@ -291,7 +382,10 @@ class MutantCommitRunner(BaseCommitRunner):
         if self.disable_incompetent:
             args.append("--disable-incompetent")
 
-        rc = self.conda_pytest(args, cwd=self.work_dir, log_file=log)
+        # Ensure *this* mutant run doesn't reuse previous caches
+        run_tag = f"mut-{safe}"
+
+        rc = self.conda_pytest(args, cwd=self.work_dir, log_file=log, run_tag=run_tag)
 
         wrapped = dict(mu)
         wrapped["pytest_exit_code"] = rc
@@ -301,7 +395,11 @@ class MutantCommitRunner(BaseCommitRunner):
             wrapped["test_outcomes"] = json.loads(inner.read_text())
 
         out.write_text(json.dumps(wrapped, indent=2))
+
         self.restore(mu)
+
+        # Clear caches again after restore (best effort)
+        self.clear_workdir_caches()
 
     def run(self):
         try:
@@ -312,6 +410,9 @@ class MutantCommitRunner(BaseCommitRunner):
             self.uninstall_package()
             self.checkout()
             self.install_package()
+
+            # optional: clear sandbox-level caches once before starting loop
+            self.clear_global_sandbox_caches()
 
             self.preload_originals()
 
