@@ -11,7 +11,7 @@ STOP_ON_KILL="--stop-on-kill"
 TIMEOUT_MIN="--timeout-min"
 TIMEOUT_MUL="--timeout-multiplier"
 INCOMP_DISABLE = "--disable-incompetent"
-
+DROP_MISSING = "--drop-missing-tests"
 
 class ProgramMode:
 
@@ -229,6 +229,11 @@ def pytest_addoption(parser):
             "Use this flag to skip that classification."
         ),
     )
+    parser.addoption(
+        DROP_MISSING,
+        action="store_true",
+        help="Ignore missing test path arguments (files/dirs) instead of erroring.",
+    )
 
 
 def pytest_configure(config):
@@ -255,3 +260,60 @@ def pytest_configure(config):
         raise pytest.UsageError("Unknown --mode value")
 
     config.pluginmanager.register(plugin, "mutation_plugin")
+
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_collection(session):
+    """
+    If pytest fails during collection with a UsageError, and --drop-missing-tests
+    is enabled, drop missing filesystem paths (files/dirs) from the positional
+    selectors and retry collection.
+
+    Note: explicit nodeid selectors containing '::' are ignored entirely (we only
+    support file/dir selectors here).
+    """
+    outcome = yield
+    config = session.config
+
+    # Only act when plugin mode is enabled and user opted in.
+    if not config.getoption(MODE) or not config.getoption(DROP_MISSING):
+        return
+
+    excinfo = outcome.excinfo
+    if not excinfo or excinfo[0] is not pytest.UsageError:
+        return
+
+    orig = list(getattr(config, "args", []) or [])
+    if not orig:
+        return
+
+    kept = []
+    for a in orig:
+        # We don't support explicit nodeid selectors; drop them to avoid collection errors.
+        if "::" in a:
+            continue
+
+        p = Path(a)
+        if p.exists():
+            kept.append(a)
+
+    # Only handle if we actually dropped something
+    if kept == orig:
+        return
+
+    print("\n[mutation-runner] dropped test selectors:")
+    for a in orig:
+        if a not in kept:
+            print("  ", a)
+
+    config.args = kept
+
+    # Retry collection (if kept is empty, fall back to normal discovery)
+    if kept:
+        session.perform_collect(args=kept, genitems=True)
+    else:
+        session.perform_collect(genitems=True)
+
+    outcome.force_result(None)
+
