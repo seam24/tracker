@@ -522,7 +522,7 @@ for t in targets:
             ignore_args += ["--ignore", p]
 
         forced = ["--cache-clear", "--basetemp", str(basetemp)]
-        cmd = ["conda", "run", "-n", self.conda_env, "pytest"] + forced + ignore_args + self.test_paths + args
+        cmd = ["conda", "run", "-n", self.conda_env, "python", "-m", "pytest"] + forced + ignore_args + self.test_paths + args
         return run_allow_fail(cmd, cwd=cwd, env=self.env, log_file=log_file)
 
     def cleanup(self):
