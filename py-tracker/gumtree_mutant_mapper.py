@@ -1,8 +1,9 @@
+# gumtree_mutant_mapper.py
 import subprocess
 import tempfile
 import os
 import xml.etree.ElementTree as ET
-from typing import Dict, Optional, Union, Iterable, Tuple
+from typing import Dict, Optional, Union, Iterable, Tuple, Any
 import uuid
 
 
@@ -11,9 +12,11 @@ class InvalidOutputError(Exception):
     """Raise invalid output error"""
     pass
 
+
 class MutTrackFailureError(Exception):
     """Raise invalid output error"""
     pass
+
 
 def char_index_to_line(content: str) -> Dict[int, int]:
     """
@@ -29,15 +32,16 @@ def char_index_to_line(content: str) -> Dict[int, int]:
         chr_to_line[idx] = line_num
         if content[idx] == '\r':
             # Handle Windows CRLF line breaks
-            if idx + 1 < len(content) and content[idx + 1] == '\n': # '\r\n'
-                chr_to_line[idx + 1] = line_num   # map '\n' to same line
-                idx += 1 # skip the '\n'
+            if idx + 1 < len(content) and content[idx + 1] == '\n':  # '\r\n'
+                chr_to_line[idx + 1] = line_num  # map '\n' to same line
+                idx += 1  # skip the '\n'
             line_num += 1
         elif content[idx] == '\n':
             # Handle Unix LF line breaks
             line_num += 1
         idx += 1
     return chr_to_line
+
 
 def gumdiff(src1: str, src2: str, lang: str = ".py", commands: list[str] = None) -> str:
     """
@@ -66,6 +70,13 @@ def gumdiff(src1: str, src2: str, lang: str = ".py", commands: list[str] = None)
     ------
     RuntimeError
         If the GumTree process fails.
+
+    Notes
+    -----
+    - This function uses `docker run --rm gumtreediff/gumtree ...` which has a non-trivial
+      startup overhead. When mapping many mutants across a commit range, you should avoid
+      calling this repeatedly for the same file/commit pair. Instead compute the diff once
+      and reuse it (see `map_mutant_with_diff()`).
     """
     if commands is None:
         commands = ["textdiff"]  # or whatever GumTree subcommand you use
@@ -78,9 +89,9 @@ def gumdiff(src1: str, src2: str, lang: str = ".py", commands: list[str] = None)
         a_path = os.path.join(tmp, a_name)
         b_path = os.path.join(tmp, b_name)
 
-        with open(a_path, "w") as f:
+        with open(a_path, "w", encoding="utf-8") as f:
             f.write(src1)
-        with open(b_path, "w") as f:
+        with open(b_path, "w", encoding="utf-8") as f:
             f.write(src2)
 
         # Run GumTree Docker image
@@ -99,26 +110,38 @@ def gumdiff(src1: str, src2: str, lang: str = ".py", commands: list[str] = None)
 
 
 def analyse_node_changes(
-        diff_outputs: str,
-        content_src: str,
-        content_dst: str,
-        types: Optional[Iterable[str]] = None,
+    diff_outputs: str,
+    content_src: str,
+    content_dst: str,
+    types: Optional[Iterable[str]] = None,
 ) -> Dict[str, Dict[str, Union[int, str, None]]]:
     """
-    Parse XML diff output to extract method declaration change information and map
+    Parse XML diff output to extract node change information and map
     character index ranges to line numbers in both source and destination contents.
 
     Args:
-        diff_outputs (str): XML string output from a tree differencing tool (e.g., GumTree).
-        content_src (str): Source file content (before the change).
-        content_dst (str): Destination file content (after the change).
+        diff_outputs (str): XML string output from GumTree `axmldiff`.
+        content_src (str): Source file content (newer / "from" side).
+        content_dst (str): Destination file content (older / "to" side).
+        types (Optional[Iterable[str]]): Optional AST node-type filter. If provided,
+            only nodes whose `type` attribute is in this set are recorded.
 
     Returns:
-        Dict[str, Dict[str, Union[int, str, None]]]: A dictionary keyed by source line range
-            (e.g., "12-20"), each containing:
-                - start_pos, end_pos (in destination content)
-                - start_lno, end_lno (in destination)
-                - label (method name or ID [optional (None)])
+        Dict[str, Dict[str, Union[int, str, None]]]:
+            Keyed by *source* character range string:
+                "src_start_pos-src_end_pos"
+            where src_end_pos is INCLUSIVE.
+
+            Each value contains (among other fields):
+                - dst_start_pos, dst_end_pos (inclusive), or None if node deleted
+
+    Notes
+    -----
+    - This mapping is intended to be re-used: for a fixed file and fixed commit pair,
+      the AST correspondence does not depend on which mutant we are mapping.
+    - End positions are stored as INCLUSIVE indices to match the original logic in
+      our `map_mutant()` / `mutant_pos_key` computation:
+          mutant_pos_key = f"{start}-{end-1}"
     """
     root = ET.fromstring(diff_outputs)
 
@@ -129,11 +152,8 @@ def analyse_node_changes(
 
     out: Dict[str, Dict[str, Union[int, str, None]]] = {}
     for element in root.iter():
-        src_pos, src_end_pos = None, None  # for default key
         node_type = element.get('type')
-        if (node_type is None) or (
-                type_filter is not None and node_type not in type_filter
-        ):
+        if (node_type is None) or (type_filter is not None and node_type not in type_filter):
             continue
 
         try:
@@ -141,60 +161,45 @@ def analyse_node_changes(
             src_pos = element.get("pos")
             src_length = element.get("length")
             if src_pos is None or src_length is None:
-                src_pos, src_end_pos = None, None
                 raise InvalidOutputError("[Invalid Output] pos and length must exist")
-            # ---- ORIGINAL ---------------------------------------
-            # src_pos = int(src_pos)
-            # src_length = int(src_length)
-            # src_end_pos = src_pos + src_length
-            # src_start_lno = chr_to_line_src[src_pos]
-            # src_end_lno = chr_to_line_src[src_pos + src_length]
-            # ---- UPDATED ---------------------------------------
+
             src_pos = int(src_pos)
             src_length = int(src_length)
+
+            # inclusive end
             src_end_pos = src_pos + src_length - 1
             src_start_lno = chr_to_line_src[src_pos]
             src_end_lno = chr_to_line_src[src_end_pos]
 
-            # optional destination range - e.g., deletion
+            # optional destination range (deleted nodes may lack other_pos/other_length)
             dst_pos = element.get('other_pos')
-            # ---- ORIGINAL ---------------------------------------
-            # dst_length = element.get('other_pos')
-            # ---- UPDATED ---------------------------------------
             dst_length = element.get('other_length')
-            if dst_pos is None:
-                if dst_length is None:
-                    raise TypeError(f"Node {src_pos}-{src_end_pos} has been deleted")
-                else:
-                    dst_length = None
-                    raise InvalidOutputError(
-                        f"[Invalid Output] 'other_length' must be also None: {dst_length}for the node-{src_pos}-{src_end_pos}")
 
-            # ---- ORIGINAL ---------------------------------------
-            # dst_pos = int(dst_pos)
-            # dst_length = int(dst_length)
-            # dst_end_pos = dst_pos + dst_length
-            # dst_start_lno = chr_to_line_dst[dst_pos]
-            # dst_end_lno = chr_to_line_dst[dst_pos + dst_length]
-            # ---- UPDATED ---------------------------------------
-            dst_pos = int(dst_pos)
-            dst_length = int(dst_length)
-            dst_end_pos = dst_pos + dst_length - 1
-            dst_start_lno = chr_to_line_dst[dst_pos]
-            dst_end_lno = chr_to_line_dst[dst_end_pos]
+            if dst_pos is None:
+                # Deleted node: represent by None destination coords
+                dst_pos, dst_end_pos = None, None
+                dst_start_lno, dst_end_lno = None, None
+            else:
+                if dst_length is None:
+                    raise InvalidOutputError(
+                        f"[Invalid Output] 'other_length' missing for node-{src_pos}-{src_end_pos}"
+                    )
+
+                dst_pos = int(dst_pos)
+                dst_length = int(dst_length)
+
+                # inclusive end
+                dst_end_pos = dst_pos + dst_length - 1
+                dst_start_lno = chr_to_line_dst[dst_pos]
+                dst_end_lno = chr_to_line_dst[dst_end_pos]
 
         except InvalidOutputError as e:
             raise e
         except KeyError as e:
             raise type(e)("[PosNotExist] position does not exist in chr_to_line_src/dst") from e
-        except TypeError as e:  # None
-            #print(e)
-            dst_pos, dst_end_pos = None, None
-            dst_start_lno, dst_end_lno = None, None
-        except ValueError as e:  # malformed attributes
+        except ValueError as e:
             raise type(e)("[Invalid value] malformed attributes") from e
 
-        # get label
         label = element.get('label')
         key = f"{src_pos}-{src_end_pos}"
         out[key] = {
@@ -212,7 +217,7 @@ def analyse_node_changes(
     return out
 
 
-def diff(a:str,b:str, lang:str=".py",target_only_mths:bool = True):
+def diff(a: str, b: str, lang: str = ".py", target_only_mths: bool = True):
     """
     Compute an AST-based diff between two source code versions using GumTree.
 
@@ -224,9 +229,9 @@ def diff(a:str,b:str, lang:str=".py",target_only_mths:bool = True):
     Parameters
     ----------
     a : str
-        The first version of the source code (e.g., "old" version).
+        The first version of the source code (typically the "from"/newer version).
     b : str
-        The second version of the source code (e.g., "new" version).
+        The second version of the source code (typically the "to"/older version).
     lang : str, optional
         Programming language extension to inform GumTree’s parser (default ".py").
         Examples: ".py", ".java", ".c".
@@ -240,14 +245,8 @@ def diff(a:str,b:str, lang:str=".py",target_only_mths:bool = True):
     -------
     dict
         A mapping of changed nodes when `target_only_mths` is False.
-        Keys are `"start-end"` character position ranges from the source version `a`.
-        Values are dictionaries with details such as:
-            - type (str): AST node type.
-            - label (str or None): Identifier or label of the node.
-            - src_start_pos, src_end_pos (int): Character positions in `a`.
-            - dst_start_pos, dst_end_pos (int or None): Character positions in `b`.
-            - src_start_lno, src_end_lno (int): Line numbers in `a`.
-            - dst_start_lno, dst_end_lno (int or None): Line numbers in `b`.
+        Keys are `"start-end"` character position ranges from `a` (inclusive end).
+        Values are dictionaries with details such as destination ranges.
 
     Raises
     ------
@@ -259,14 +258,15 @@ def diff(a:str,b:str, lang:str=".py",target_only_mths:bool = True):
     Notes
     -----
     - Internally calls `gumdiff()` to run GumTree’s `axmldiff` command.
-    - Designed to be a helper for higher-level mutant tracking (e.g., `mu_map()`).
+    - IMPORTANT for performance: `diff(a, b)` is expensive. If we need to map
+      multiple mutants for the same (a, b, file) pair, compute this once and reuse it
+      via `map_mutant_with_diff()`.
     """
-    diff_out=gumdiff(a,b,lang,commands=["axmldiff"])
+    diff_out = gumdiff(a, b, lang, commands=["axmldiff"])
     if target_only_mths:
         raise NotImplementedError("analyse_mth_changes method has not been implemented!")
-    else:
-        ret = analyse_node_changes(diff_out, content_src=a, content_dst=b)
-    return ret
+    return analyse_node_changes(diff_out, content_src=a, content_dst=b)
+
 
 # endregion
 
@@ -279,23 +279,58 @@ def map_mutant(
     verbose: bool = True,
 ) -> Tuple[Optional[str], Optional[int], Optional[int]]:
     """
+    Convenience wrapper that maps exactly one mutant by computing GumTree diff internally.
+
     Returns
     -------
     (mapped_mutant, new_start_pos, new_end_pos)
 
     - mapped_mutant: mutated version of `src_to` with the mutant applied, or None if
       the node was deleted / cannot be tracked.
-    - new_start_pos: inclusive start index of the mutant in mapped_mutant (using code_mutate convention), or None.
-    - new_end_pos:  end index of the mutant in mapped_mutant (using code_mutate convention), or None.
+    - new_start_pos: inclusive start index of the mutant in mapped_mutant
+    - new_end_pos:  end index of the mutant in mapped_mutant (code_mutate convention)
+
+    Notes
+    -----
+    - This function is SIMPLE but EXPENSIVE: it runs GumTree diff every call.
+      When mapping many mutants across the same file and commit pair, it is usually better to do the following instead:
+        1) compute `updated_node_range = diff(src_from, src_to, ...)` once
+        2) call `map_mutant_with_diff(..., updated_node_range=updated_node_range)` for each mutant
     """
     updated_node_range = diff(src_from, src_to, lang, target_only_mths=False)
+    return map_mutant_with_diff(
+        src_to=src_to,
+        mu_info_from=mu_info_from,
+        updated_node_range=updated_node_range,
+        verbose=verbose,
+    )
+
+
+def map_mutant_with_diff(
+    src_to: str,
+    mu_info_from: Dict[str, Any],
+    updated_node_range: Dict[str, Dict[str, Any]],
+    verbose: bool = True,
+) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    """
+    Fast-path mutant mapping using a precomputed GumTree AST diff.
+
+    This function assumes that the caller has already computed the AST mapping for the
+    corresponding (src_from, src_to) file pair.
+
+    Unlike `map_mutant()`, this function:
+      - does NOT invoke GumTree
+      - performs only dictionary lookups + string slicing
+
+    Intended use case:
+      - multiple mutants in the same file
+      - mapping across the same commit transition
+      - compute diff once, map many mutants cheaply
+    """
     mutant_pos_key = f"{mu_info_from['mutation_start_pos']}-{mu_info_from['mutation_end_pos']-1}"
 
     tnode = updated_node_range.get(mutant_pos_key)
-    if tnode is None:  # does not exist
-        # raise MutTrackFailureError(
-        #     f"[Mutant-Track] failed to find the mutant {mu_info_from['mutant_id']} at {mutant_pos_key}"
-        # )
+    if tnode is None:
         if verbose:
             print(f"[Mutant-Track] failed to find the mutant {mu_info_from['mutant_id']} at {mutant_pos_key}")
         return None, None, None
@@ -308,20 +343,18 @@ def map_mutant(
                 f"[Log] mutant {mu_info_from['mutant_id']} can't be tracked anymore "
                 f"as the target node is deleted"
             )
-        # consistent 3-tuple
         return None, None, None
 
     mutant_value = mu_info_from["mutant_value"]
 
     # Build mutated target source
-    mapped_mutant = src_to[:dst_start_pos] + mutant_value + src_to[dst_end_pos + 1 :]
+    mapped_mutant = src_to[:dst_start_pos] + mutant_value + src_to[dst_end_pos + 1:]
 
     # positions in the *mutated* code, using code_mutate convention
     new_start_pos = dst_start_pos
     new_end_pos = dst_end_pos + 1
 
     return mapped_mutant, new_start_pos, new_end_pos
-
 
 
 def test_case1():
@@ -355,7 +388,7 @@ def test_case1():
         print(y+y-1)
     """
 
-    mapped_mutants, new_start_pos, new_end_pos=map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
+    mapped_mutants, new_start_pos, new_end_pos = map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
 
     expected_mutant = """
     import os
@@ -371,7 +404,8 @@ def test_case1():
         print(y+y-1)
     """
 
-    assert mapped_mutants==expected_mutant
+    assert mapped_mutants == expected_mutant
+
 
 def test_case2():
     src_from = """
@@ -404,7 +438,7 @@ def test_case2():
         print(y+y-1)
     """
 
-    mapped_mutants, new_start_pos, new_end_pos= map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
+    mapped_mutants, new_start_pos, new_end_pos = map_mutant(src_from, src_to, mu_info_from, lang=".py", verbose=False)
 
     expected_mutant = """
     import os
@@ -420,4 +454,4 @@ def test_case2():
         print(y+y-1)
     """
 
-    assert mapped_mutants==expected_mutant
+    assert mapped_mutants == expected_mutant

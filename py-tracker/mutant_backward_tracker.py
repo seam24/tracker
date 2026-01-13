@@ -1,3 +1,4 @@
+# mutant_backward_tracker.py
 from __future__ import annotations
 
 import argparse
@@ -6,9 +7,13 @@ import ast
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any
+from collections import defaultdict
 
 from git import Repo
-from gumtree_mutant_mapper import map_mutant  # your GumTree-based mapper
+
+# We import `diff` and `map_mutant_with_diff` so we can compute GumTree mapping ONCE per file
+# and reuse it across all mutants in that file for the same commit transition.
+from gumtree_mutant_mapper import diff, map_mutant_with_diff
 
 
 # --------------------------------------------------------------------
@@ -324,6 +329,28 @@ def main() -> None:
     # ----------------------------------------------------------------
     # Walk history: HEAD (baseline) → earlier commits
     # ----------------------------------------------------------------
+    #
+    # IMPORTANT PERFORMANCE NOTE (Diff Reuse)
+    # --------------------------------------
+    # For a fixed commit transition (newer -> older) and a fixed file path,
+    # the GumTree AST diff is IDENTICAL for all mutants in that file.
+    #
+    # Therefore, we must NEVER recompute GumTree diffs per mutant.
+    #
+    # Instead, for each commit step we:
+    #   1) group all active mutants by file
+    #   2) detect which files changed between commits
+    #   3) run GumTree diff ONCE per changed file
+    #   4) reuse the resulting AST mapping to translate all mutants in that file
+    #
+    # This reduces the per-step complexity from:
+    #   O(#mutants_in_changed_files × GumTree)
+    # to:
+    #   O(#changed_files × GumTree + #mutants)
+    #
+    # This optimization is crucial for scalability when tracking thousands
+    # of mutants across long Git histories.
+    #
 
     previous = head_commit  # this is the 'newer' side in each pair
 
@@ -349,9 +376,23 @@ def main() -> None:
         print(f"Active mutants this step: {len(active_uids)}")
         print("===========================================================")
 
-        # --- precompute which files changed and cache contents ---
-        active_files = {mutant_states[uid]["file"] for uid in active_uids}
+        # ----------------------------------------------------------------
+        # Group active mutants by file
+        # ----------------------------------------------------------------
+        #
+        # Mutants are grouped by their source file so that:
+        #   - unchanged files can propagate all mutants trivially
+        #   - changed files require exactly ONE GumTree diff per file
+        #
+        # This grouping is the key enabler for diff reuse.
+        #
+        active_by_file: dict[str, list[str]] = defaultdict(list)
+        for uid in active_uids:
+            active_by_file[mutant_states[uid]["file"]].append(uid)
 
+        active_files = set(active_by_file.keys())
+
+        # --- precompute which files changed and cache contents ---
         file_changed: dict[str, bool] = {}
         src_newer_cache: dict[str, str | None] = {}
         src_older_cache: dict[str, str | None] = {}
@@ -376,117 +417,148 @@ def main() -> None:
             src_newer_cache[path] = get_file_content(newer, path)
             src_older_cache[path] = get_file_content(older, path)
 
-        # For each mutant that is still active, try to map it one step back
-        for uid in active_uids:
-            state = mutant_states[uid]
-            path = state["file"]
-            info = state["info"]
-            local_id = info["mutant_id"]
+        # ----------------------------------------------------------------
+        # Diff cache (per commit step)
+        # ----------------------------------------------------------------
+        #
+        # diff_cache[path] stores the AST mapping produced by GumTree
+        # for the transition:
+        #     newer_commit:file  ->  older_commit:file
+        #
+        # The mapping is a dictionary keyed by:
+        #     "src_start_pos-src_end_pos"   (inclusive end)
+        #
+        # IMPORTANT:
+        #   - GumTree is invoked AT MOST ONCE per (commit, file) pair
+        #   - All mutants in the same file reuse this cached mapping
+        #
+        diff_cache: dict[str, dict | None] = {}
 
+        # ----------------------------------------------------------------
+        # Compute GumTree diff ONCE per changed file
+        # ----------------------------------------------------------------
+        #
+        # GumTree is expensive (Docker startup + AST matching).
+        # We therefore compute the diff only once per file and cache it.
+        #
+        # If the diff fails for a file, all mutants in that file will
+        # stop propagating at this commit with reason="no_mapping".
+        #
+        for path in active_files:
+            if not file_changed.get(path, True):
+                continue
+
+            src_newer = src_newer_cache.get(path)
+            src_older = src_older_cache.get(path)
+
+            if src_newer is None or src_older is None:
+                diff_cache[path] = None
+                continue
+
+            try:
+                diff_cache[path] = diff(src_newer, src_older, lang=".py", target_only_mths=False)
+            except Exception as e:
+                if args.verbose:
+                    print(f"[Diff] Failed for {path} newer={newer.hexsha} older={older.hexsha}: {e}")
+                diff_cache[path] = None
+
+        # ----------------------------------------------------------------
+        # Propagate mutants file-by-file (reuse cached diffs)
+        # ----------------------------------------------------------------
+        for path, uids_in_file in active_by_file.items():
             src_newer = src_newer_cache.get(path)
             src_older = src_older_cache.get(path)
 
             # If file is missing in either commit: stop tracking this mutant (no reason tracked)
             if src_newer is None or src_older is None:
-                deactivate_mutant(state, reason=None)
+                for uid in uids_in_file:
+                    deactivate_mutant(mutant_states[uid], reason=None)
                 continue
 
             if not file_changed[path]:
-                # file did not change: mutant trivially propagates with same coords
+                # file did not change: all mutants trivially propagate with same coords
+                for uid in uids_in_file:
+                    state = mutant_states[uid]
+                    state["last_commit"] = older.hexsha
+                    state["history"].append(
+                        {
+                            "commit": older.hexsha,
+                            "date": older.committed_datetime.isoformat(),
+                            "start_pos": state["current_start"],
+                            "end_pos": state["current_end"],
+                        }
+                    )
+                continue
+
+            mapping = diff_cache.get(path)
+            if not mapping:
+                # diff failed => cannot map any mutant in this file for this step
+                for uid in uids_in_file:
+                    deactivate_mutant(mutant_states[uid], reason="no_mapping")
+                continue
+
+            # file changed + mapping available => map each mutant using cached mapping
+            for uid in uids_in_file:
+                state = mutant_states[uid]
+                info = state["info"]
+                local_id = info["mutant_id"]
+
+                mu_step = {
+                    "mutant_id": local_id,  # keep original id for logging
+                    "file": path,
+                    "mutation_start_pos": state["current_start"],
+                    "mutation_end_pos": state["current_end"],
+                    "mutant_value": info["mutant_value"],
+                }
+
+                # --------------------------------------------------------
+                # Fast mutant mapping using cached AST diff
+                # --------------------------------------------------------
+                #
+                # At this point:
+                #   - GumTree has already been executed for this file
+                #   - `mapping` contains the full src→dst node correspondence
+                #
+                # Mapping a mutant now reduces to:
+                #   1) lookup its source node range in the mapping
+                #   2) apply the mutant_value at the mapped destination range
+                #
+                #
+                mapped_mutant, new_start_pos, new_end_pos = map_mutant_with_diff(
+                    src_to=src_older,
+                    mu_info_from=mu_step,
+                    updated_node_range=mapping,
+                    verbose=args.verbose,
+                )
+
+                if mapped_mutant is None:
+                    deactivate_mutant(state, reason="no_mapping")
+                    continue
+
+                # --- SANITY CHECK: reconstruct and parse on older version ---
+                mutated_src_older = apply_mutant(
+                    src_older,
+                    new_start_pos,
+                    new_end_pos,
+                    info["mutant_value"],
+                )
+
+                if not is_parseable_python(mutated_src_older):
+                    deactivate_mutant(state, reason="unparseable")
+                    continue
+
+                # successfully mapped to `older`
+                state["current_start"] = new_start_pos
+                state["current_end"] = new_end_pos
                 state["last_commit"] = older.hexsha
                 state["history"].append(
                     {
                         "commit": older.hexsha,
                         "date": older.committed_datetime.isoformat(),
-                        "start_pos": state["current_start"],
-                        "end_pos": state["current_end"],
+                        "start_pos": new_start_pos,
+                        "end_pos": new_end_pos,
                     }
                 )
-                continue
-
-            # --- file changed: need GumTree-based mapping ---
-
-            mu_step = {
-                "mutant_id": local_id,  # keep original id for logging
-                "file": path,
-                "mutation_start_pos": state["current_start"],
-                "mutation_end_pos": state["current_end"],
-                "mutant_value": info["mutant_value"],
-            }
-
-            # We want to map from newer -> older
-            mapped_mutant, new_start_pos, new_end_pos = map_mutant(
-                src_from=src_newer,
-                src_to=src_older,
-                mu_info_from=mu_step,
-                lang=".py",
-                verbose=args.verbose,
-            )
-
-            if mapped_mutant is None:
-                # cannot propagate further back -> stop tracking
-                deactivate_mutant(state, reason="no_mapping")
-                continue
-
-            # --- SANITY CHECK: reconstruct and parse on older version ---
-            mutated_src_older = apply_mutant(
-                src_older,
-                new_start_pos,
-                new_end_pos,
-                info["mutant_value"],
-            )
-
-            if not is_parseable_python(mutated_src_older):
-                # Debug block you can uncomment if needed:
-                # print(
-                #     f"[WARN] Mutant {uid} became unparsable at commit {older.hexsha}. "
-                #     f"start={new_start_pos}, end={new_end_pos}"
-                # )
-                # print(info)
-                # print_mutation_view(
-                #     label="NEWER original (before mapping)",
-                #     src=src_newer,
-                #     start=state["current_start"],
-                #     end=state["current_end"],
-                #     path=path,
-                #     commit_hex=newer.hexsha,
-                #     context_lines=2,
-                # )
-                # print_mutation_view(
-                #     label="OLDER original (before applying mutant_value)",
-                #     src=src_older,
-                #     start=new_start_pos,
-                #     end=new_end_pos,
-                #     path=path,
-                #     commit_hex=older.hexsha,
-                #     context_lines=2,
-                # )
-                # mutated_start = new_start_pos
-                # mutated_end = new_start_pos + len(info["mutant_value"])
-                # print_mutation_view(
-                #     label="OLDER mutated (after applying mutant_value)",
-                #     src=mutated_src_older,
-                #     start=mutated_start,
-                #     end=mutated_end,
-                #     path=path,
-                #     commit_hex=older.hexsha,
-                #     context_lines=2,
-                # )
-                deactivate_mutant(state, reason="unparseable")
-                continue
-
-            # successfully mapped to `older`
-            state["current_start"] = new_start_pos
-            state["current_end"] = new_end_pos
-            state["last_commit"] = older.hexsha
-            state["history"].append(
-                {
-                    "commit": older.hexsha,
-                    "date": older.committed_datetime.isoformat(),
-                    "start_pos": new_start_pos,
-                    "end_pos": new_end_pos,
-                }
-            )
 
         # Move the window one step back
         previous = older
