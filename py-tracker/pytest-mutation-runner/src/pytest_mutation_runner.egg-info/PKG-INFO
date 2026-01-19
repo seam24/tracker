@@ -1,8 +1,0 @@
-Metadata-Version: 2.4
-Name: pytest-mutation-runner
-Version: 0.1.0
-Summary: Pytest plugin for program/mutant runs with timeout control
-Author: Taha Rostami
-Requires-Python: >=3.8
-Requires-Dist: pytest>=8.4.2
-Requires-Dist: pytest-timeout>=2.4.0
