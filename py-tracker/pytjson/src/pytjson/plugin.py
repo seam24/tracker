@@ -37,6 +37,7 @@ Compatibility:
   * storing plugin instance via config.stash when available, else config attribute
   * avoiding _pytest.timing.Instant if missing
   * providing fallback for nodes.SEP import
+  * using a pluggy-safe pytest_terminal_summary signature
 """
 
 from __future__ import annotations
@@ -81,6 +82,7 @@ class _CompatInstant:
     def elapsed(self):
         class _Elapsed:
             seconds = time.time() - self._start
+
         return _Elapsed()
 
     def as_utc(self):
@@ -519,8 +521,14 @@ class LogJUnitJSON:
                     }
                 else:
                     longrepr = getattr(report, "longrepr", None)
-                    reprcrash: ReprFileLocation | None = getattr(longrepr, "reprcrash", None)
-                    message = reprcrash.message if reprcrash is not None else str(longrepr)
+                    reprcrash: ReprFileLocation | None = getattr(
+                        longrepr, "reprcrash", None
+                    )
+                    message = (
+                        reprcrash.message
+                        if reprcrash is not None
+                        else str(longrepr)
+                    )
                     case.failure = {
                         "message": bin_text_escape(message),
                         "text": bin_text_escape(longrepr),
@@ -830,7 +838,16 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         plugin.on_sessionfinish(session, exitstatus)
 
 
-def pytest_terminal_summary(terminalreporter: TerminalReporter, config: Config) -> None:
+# IMPORTANT: pluggy validation on older pytest breaks if we declare args
+# that aren't in the hookspec. So we accept *args/**kwargs and recover config.
+def pytest_terminal_summary(terminalreporter: TerminalReporter, *args, **kwargs) -> None:
     plugin = _get_active()
-    if plugin is not None:
-        plugin.on_terminal_summary(terminalreporter, config)
+    if plugin is None:
+        return
+
+    config = kwargs.get("config", getattr(terminalreporter, "config", None))
+    if config is None:
+        # Extremely old/odd environments: just skip printing.
+        return
+
+    plugin.on_terminal_summary(terminalreporter, config)
