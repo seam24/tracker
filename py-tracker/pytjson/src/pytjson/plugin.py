@@ -3,10 +3,11 @@
 """
 A minimal "JUnit-XML equivalent, but JSON" reporter for pytest.
 
-Goal:
-- Similar information level to pytest's built-in junitxml plugin
-- JSON output shaped like JUnit: testsuites -> testsuite -> testcase
-- By default behaves like junit_family=xunit2 (minimal testcase fields)
+Compatibility goals:
+- Works across a wide range of pytest + pluggy versions (incl. older ones)
+- Works on Python 3.7+ (no PEP604 unions, no runtime-evaluated typing that breaks)
+- Avoids hook signature mismatches by using *args/**kwargs where pytest changed hooks
+- Avoids hard dependencies on internal pytest modules that moved over time
 
 CLI:
   pytest --junit-json=report.json
@@ -23,26 +24,10 @@ INI (reuses junitxml names for familiarity):
   junit_log_passing_tests = true|false
   junit_duration_report = total|call
   junit_family = legacy|xunit1|xunit2   (default xunit2)
-
-Notes:
-- Avoids writing on xdist workers (master writes single file).
-- If junit_family is xunit2, testcase includes only classname/name/time (+ outcome nodes).
-- If junit_family is xunit1/legacy, testcase may also include file/line/url (like junitxml legacy attrs).
-- Meta supports JSON-native scalar types (str/int/float/bool/null).
-- NDJSON option A: one line per *test run* (entire doc on one line).
-
-Compatibility:
-- Supports older pytest/pluggy by:
-  * exposing module-level hook functions (no class-instance hook registration)
-  * storing plugin instance via config.stash when available, else config attribute
-  * avoiding _pytest.timing.Instant if missing
-  * providing fallback for nodes.SEP import
-  * using a pluggy-safe pytest_terminal_summary signature
 """
 
-from __future__ import annotations
+from __future__ import absolute_import, division, print_function
 
-from collections.abc import Callable
 import datetime
 import functools
 import json
@@ -51,22 +36,60 @@ import platform
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+
+# typing: keep safe for py3.7 + avoid runtime issues
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
-from _pytest._code.code import ExceptionRepr, ReprFileLocation
-from _pytest.config import Config, filename_arg
-from _pytest.config.argparsing import Parser
-from _pytest.fixtures import FixtureRequest
-from _pytest.reports import TestReport
-from _pytest.terminal import TerminalReporter
-
 
 # -----------------------------------------------------------------------------
-# Compat: nodes.SEP moved around; fall back to "::" -> "." replacement if needed
+# Best-effort imports from pytest internals (these moved across versions).
+# We always provide fallbacks so the plugin still loads on older pytest.
+# -----------------------------------------------------------------------------
+try:
+    from _pytest.config import Config  # type: ignore
+except Exception:  # pragma: no cover
+    Config = Any  # type: ignore
+
+try:
+    from _pytest.config.argparsing import Parser  # type: ignore
+except Exception:  # pragma: no cover
+    Parser = Any  # type: ignore
+
+try:
+    # filename_arg is a helper used by pytest's junitxml plugin; might not exist.
+    from _pytest.config import filename_arg  # type: ignore
+except Exception:  # pragma: no cover
+    filename_arg = None  # type: ignore
+
+try:
+    from _pytest.reports import TestReport  # type: ignore
+except Exception:  # pragma: no cover
+    TestReport = Any  # type: ignore
+
+try:
+    from _pytest.fixtures import FixtureRequest  # type: ignore
+except Exception:  # pragma: no cover
+    FixtureRequest = Any  # type: ignore
+
+try:
+    from _pytest.terminal import TerminalReporter  # type: ignore
+except Exception:  # pragma: no cover
+    TerminalReporter = Any  # type: ignore
+
+# ExceptionRepr/ReprFileLocation moved around; treat as Any if unavailable.
+try:
+    from _pytest._code.code import ExceptionRepr, ReprFileLocation  # type: ignore
+except Exception:  # pragma: no cover
+    ExceptionRepr = Any  # type: ignore
+    ReprFileLocation = Any  # type: ignore
+
+# -----------------------------------------------------------------------------
+# Compat: nodes.SEP moved around; fall back to "/" so we can replace with "."
 # -----------------------------------------------------------------------------
 try:
     from _pytest import nodes as _nodes  # type: ignore
+
     _NODE_SEP = getattr(_nodes, "SEP", "/")
 except Exception:
     _NODE_SEP = "/"
@@ -75,78 +98,105 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Compat: timing.Instant exists only on newer pytest
 # -----------------------------------------------------------------------------
-class _CompatInstant:
-    def __init__(self):
+class _CompatInstant(object):
+    def __init__(self) -> None:
         self._start = time.time()
 
-    def elapsed(self):
-        class _Elapsed:
+    def elapsed(self) -> Any:
+        class _Elapsed(object):
             seconds = time.time() - self._start
 
         return _Elapsed()
 
-    def as_utc(self):
+    def as_utc(self) -> datetime.datetime:
         return datetime.datetime.utcfromtimestamp(self._start)
 
 
 try:
-    from _pytest import timing  # type: ignore
+    from _pytest import timing as _timing  # type: ignore
 except Exception:
-    timing = None  # type: ignore
+    _timing = None  # type: ignore
 
 
-def _new_instant():
-    if timing is not None and hasattr(timing, "Instant"):
-        return timing.Instant()  # type: ignore[attr-defined]
+def _new_instant() -> Any:
+    if _timing is not None and hasattr(_timing, "Instant"):
+        try:
+            return _timing.Instant()  # type: ignore[attr-defined]
+        except Exception:
+            return _CompatInstant()
     return _CompatInstant()
 
 
 # -----------------------------------------------------------------------------
-# Compat: stash only exists on newer pytest
+# Compat: stash only exists on newer pytest. Use it if available, else config attr.
 # -----------------------------------------------------------------------------
+json_key = None
 try:
-    from _pytest.stash import StashKey  # pytest>=7
+    from _pytest.stash import StashKey  # type: ignore
 
-    json_key = StashKey["LogJUnitJSON"]()
+    json_key = StashKey("LogJUnitJSON")  # older typing-friendly usage
 except Exception:
     StashKey = None  # type: ignore
-    json_key = None  # type: ignore
+    json_key = None
+
+_ACTIVE = None  # type: Optional["LogJUnitJSON"]
 
 
-_ACTIVE: "LogJUnitJSON | None" = None
-
-
-def _set_active(config: Config, plugin: "LogJUnitJSON") -> None:
+def _set_active(config: Any, plugin: "LogJUnitJSON") -> None:
     global _ACTIVE
     _ACTIVE = plugin
-    if hasattr(config, "stash") and json_key is not None:
-        config.stash[json_key] = plugin  # type: ignore[index]
-    else:
+
+    # prefer stash (pytest>=7), but don't assume it's present
+    try:
+        if hasattr(config, "stash") and json_key is not None:
+            config.stash[json_key] = plugin
+            return
+    except Exception:
+        pass
+
+    # fallback: attach to config
+    try:
         setattr(config, "_junitjson_plugin", plugin)
+    except Exception:
+        pass
 
 
-def _get_active_from_config(config: Config) -> "LogJUnitJSON | None":
-    if hasattr(config, "stash") and json_key is not None:
-        return config.stash.get(json_key, None)  # type: ignore[union-attr]
-    return getattr(config, "_junitjson_plugin", None)
+def _get_active_from_config(config: Any) -> Optional["LogJUnitJSON"]:
+    try:
+        if hasattr(config, "stash") and json_key is not None:
+            return config.stash.get(json_key, None)
+    except Exception:
+        pass
+    try:
+        return getattr(config, "_junitjson_plugin", None)
+    except Exception:
+        return None
 
 
-def _get_active() -> "LogJUnitJSON | None":
+def _get_active() -> Optional["LogJUnitJSON"]:
     return _ACTIVE
 
 
-def _del_active(config: Config) -> None:
+def _del_active(config: Any) -> None:
     global _ACTIVE
-    if hasattr(config, "stash") and json_key is not None:
-        try:
-            del config.stash[json_key]  # type: ignore[index]
-        except Exception:
-            pass
-    if hasattr(config, "_junitjson_plugin"):
-        try:
-            delattr(config, "_junitjson_plugin")
-        except Exception:
-            pass
+    try:
+        if hasattr(config, "stash") and json_key is not None:
+            try:
+                del config.stash[json_key]
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        if hasattr(config, "_junitjson_plugin"):
+            try:
+                delattr(config, "_junitjson_plugin")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     _ACTIVE = None
 
 
@@ -159,11 +209,11 @@ def bin_text_escape(arg: object) -> str:
     Keep junitxml's "visual escape" behavior for stability/readability.
     """
 
-    def repl(matchobj: re.Match[str]) -> str:
+    def repl(matchobj: Any) -> str:
         i = ord(matchobj.group())
         if i <= 0xFF:
-            return f"#x{i:02X}"
-        return f"#x{i:04X}"
+            return "#x%02X" % i
+        return "#x%04X" % i
 
     illegal_re = (
         "[^\u0009\u000a\u000d\u0020-\u007e\u0080-\ud7ff\ue000-\ufffd\u10000-\u10ffff]"
@@ -171,7 +221,7 @@ def bin_text_escape(arg: object) -> str:
     return re.sub(illegal_re, repl, str(arg))
 
 
-def mangle_test_address(address: str) -> list[str]:
+def mangle_test_address(address: str) -> List[str]:
     path, possible_open_bracket, params = address.partition("[")
     names = path.split("::")
     names[0] = names[0].replace(_NODE_SEP, ".")
@@ -180,31 +230,31 @@ def mangle_test_address(address: str) -> list[str]:
     return names
 
 
-def _check_record_param_type(param: str, v: str) -> None:
+def _check_record_param_type(param: str, v: Any) -> None:
     __tracebackhide__ = True
     if not isinstance(v, str):
         raise TypeError(
-            f"{param} parameter needs to be a string, but {type(v).__name__} given"
+            "%s parameter needs to be a string, but %s given" % (param, type(v).__name__)
         )
 
 
-def _check_meta_value(key: str, value: object) -> None:
+def _check_meta_value(key: str, value: Any) -> None:
     __tracebackhide__ = True
     if not isinstance(value, (str, int, float, bool)) and value is not None:
         raise TypeError(
-            f"meta value for {key!r} must be str|int|float|bool|None, "
-            f"got {type(value).__name__}"
+            "meta value for %r must be str|int|float|bool|None, got %s"
+            % (key, type(value).__name__)
         )
 
 
-def _parse_meta_scalar(v: str) -> object:
+def _parse_meta_scalar(v: str) -> Any:
     s = v.strip()
     low = s.lower()
     if low == "true":
         return True
     if low == "false":
         return False
-    if low in {"null", "none"}:
+    if low in ("null", "none"):
         return None
 
     if re.fullmatch(r"[+-]?\d+", s):
@@ -224,20 +274,99 @@ def _parse_meta_scalar(v: str) -> object:
     return s
 
 
+def _safe_location(report: Any) -> Tuple[Optional[str], Optional[int]]:
+    # report.location is usually (path, lineno, domain) but not guaranteed
+    try:
+        loc = getattr(report, "location", None)
+        if not loc:
+            return (None, None)
+        file_ = loc[0] if len(loc) > 0 else None
+        line_ = loc[1] if len(loc) > 1 else None
+        if line_ is not None:
+            try:
+                line_ = int(line_)
+            except Exception:
+                line_ = None
+        return (file_, line_)
+    except Exception:
+        return (None, None)
+
+
+def _safe_longrepr_text(longrepr: Any) -> str:
+    # longrepr sometimes is a string, sometimes rich object
+    try:
+        return bin_text_escape(longrepr)
+    except Exception:
+        try:
+            return bin_text_escape(str(longrepr))
+        except Exception:
+            return ""
+
+
+def _reprcrash_message(longrepr: Any) -> Optional[str]:
+    # longrepr.reprcrash.message exists on many versions, but guard it.
+    try:
+        reprcrash = getattr(longrepr, "reprcrash", None)
+        if reprcrash is None:
+            return None
+        msg = getattr(reprcrash, "message", None)
+        if msg is None:
+            return None
+        return str(msg)
+    except Exception:
+        return None
+
+
+def _get_config_verbosity(config: Any) -> int:
+    """
+    Compat: verbosity moved around over time.
+    - Newer: config.get_verbosity()
+    - Older: config.option.verbose (int)
+    """
+    try:
+        getv = getattr(config, "get_verbosity", None)
+        if callable(getv):
+            try:
+                return int(getv())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        opt = getattr(config, "option", None)
+        v = getattr(opt, "verbose", 0) if opt is not None else 0
+        return int(v or 0)
+    except Exception:
+        return 0
+
+
+def _safe_open_file(path: str, append: bool) -> Any:
+    mode = "a" if append else "w"
+    # Ensure directory exists
+    dirname = os.path.dirname(os.path.abspath(path))
+    if dirname:
+        try:
+            os.makedirs(dirname, exist_ok=True)  # py3.7 ok
+        except TypeError:
+            # py<3.2 compatibility not needed, but keep defensive.
+            if not os.path.isdir(dirname):
+                os.makedirs(dirname)
+    return open(path, mode, encoding="utf-8")
+
+
 # -----------------------------------------------------------------------------
 # Public fixtures (work with stash or attribute)
 # -----------------------------------------------------------------------------
 @pytest.fixture(scope="session")
-def record_junitjson_testsuite_property(
-    request: FixtureRequest,
-) -> Callable[[str, object], None]:
+def record_junitjson_testsuite_property(request: FixtureRequest) -> Callable[[str, object], None]:
     __tracebackhide__ = True
 
     def noop(name: str, value: object) -> None:
         __tracebackhide__ = True
         _check_record_param_type("name", name)
 
-    plugin = _get_active_from_config(request.config)
+    plugin = _get_active_from_config(getattr(request, "config", None))
     if plugin is None:
         return noop
 
@@ -257,7 +386,7 @@ def record_junitjson_meta(request: FixtureRequest) -> Callable[[str, object], No
         __tracebackhide__ = True
         _check_record_param_type("key", key)
 
-    plugin = _get_active_from_config(request.config)
+    plugin = _get_active_from_config(getattr(request, "config", None))
     if plugin is None:
         return noop
 
@@ -276,20 +405,16 @@ def record_junitjson_meta(request: FixtureRequest) -> Callable[[str, object], No
 class _CaseData:
     classname: str
     name: str
-
-    file: str | None = None
-    line: int | None = None
-    url: str | None = None
-
+    file: Optional[str] = None
+    line: Optional[int] = None
+    url: Optional[str] = None
     time: float = 0.0
-    properties: list[dict[str, str]] = None  # type: ignore[assignment]
-
-    skipped: dict[str, str] | None = None
-    failure: dict[str, str] | None = None
-    error: dict[str, str] | None = None
-
-    system_out: str | None = None
-    system_err: str | None = None
+    properties: Optional[List[Dict[str, str]]] = None
+    skipped: Optional[Dict[str, str]] = None
+    failure: Optional[Dict[str, str]] = None
+    error: Optional[Dict[str, str]] = None
+    system_out: Optional[str] = None
+    system_err: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.properties is None:
@@ -299,17 +424,17 @@ class _CaseData:
 # -----------------------------------------------------------------------------
 # Core reporter implementation (NO hook names on the class)
 # -----------------------------------------------------------------------------
-class LogJUnitJSON:
+class LogJUnitJSON(object):
     def __init__(
         self,
         logfile: str,
-        prefix: str | None,
+        prefix: Optional[str],
         suite_name: str,
         logging_mode: str,
         report_duration: str,
         family: str,
         log_passing_tests: bool,
-        meta_kv: list[tuple[str, object]],
+        meta_kv: List[Tuple[str, object]],
         ndjson: bool,
         append: bool,
     ) -> None:
@@ -318,29 +443,27 @@ class LogJUnitJSON:
         self.prefix = prefix
         self.suite_name = suite_name
         self.logging = logging_mode
-        self.log_passing_tests = log_passing_tests
+        self.log_passing_tests = bool(log_passing_tests)
         self.report_duration = report_duration
 
         self.family = "xunit1" if family == "legacy" else family
         self.ndjson = bool(ndjson)
         self.append = bool(append)
 
-        self.stats: dict[str, int] = dict.fromkeys(
-            ["error", "passed", "failure", "skipped"], 0
-        )
-        self.global_properties: list[tuple[str, str]] = []
+        self.stats = dict.fromkeys(["error", "passed", "failure", "skipped"], 0)  # type: ignore
+        self.global_properties = []  # type: List[Tuple[str, str]]
 
-        self.meta: dict[str, Any] = {}
+        self.meta = {}  # type: Dict[str, Any]
         for k, v in meta_kv:
             self.add_meta(k, v)
 
-        self._cases_order: list[tuple[str, str | None, int | None]] = []
-        self._cases: dict[tuple[str, str | None, int | None], _CaseData] = {}
+        self._cases_order = []  # type: List[Tuple[str, Optional[str], Optional[int]]]
+        self._cases = {}  # type: Dict[Tuple[str, Optional[str], Optional[int]], _CaseData]
 
-        self._open_failed_calls: list[TestReport] = []
+        self._open_failed_calls = []  # type: List[Any]
         self._cnt_double_fail_tests = 0
 
-        self._suite_start = None  # set in sessionstart
+        self._suite_start = None  # type: Any
 
     # ---- internal API used by module-level hooks ----
 
@@ -365,23 +488,28 @@ class LogJUnitJSON:
         if key in self.stats:
             self.stats[key] += 1
 
-    def _case_key(self, report: TestReport | str) -> tuple[str, str | None, int | None]:
-        nodeid = getattr(report, "nodeid", report)
-        worker_id = getattr(report, "worker_id", None)
-        item_index = getattr(report, "item_index", None)
-        return (
-            str(nodeid),
-            (str(worker_id) if worker_id is not None else None),
-            (int(item_index) if item_index is not None else None),
-        )
+    def _case_key(self, report_or_nodeid: Any) -> Tuple[str, Optional[str], Optional[int]]:
+        nodeid = getattr(report_or_nodeid, "nodeid", report_or_nodeid)
+        worker_id = getattr(report_or_nodeid, "worker_id", None)
+        item_index = getattr(report_or_nodeid, "item_index", None)
 
-    def _get_or_create_case(self, report: TestReport) -> _CaseData:
+        wid = str(worker_id) if worker_id is not None else None
+        ii = None
+        if item_index is not None:
+            try:
+                ii = int(item_index)
+            except Exception:
+                ii = None
+
+        return (str(nodeid), wid, ii)
+
+    def _get_or_create_case(self, report: Any) -> _CaseData:
         key = self._case_key(report)
         existing = self._cases.get(key)
         if existing is not None:
             return existing
 
-        names = mangle_test_address(report.nodeid)
+        names = mangle_test_address(getattr(report, "nodeid", str(key[0])))
         classnames = names[:-1]
         if self.prefix:
             classnames.insert(0, self.prefix)
@@ -389,39 +517,32 @@ class LogJUnitJSON:
         classname = ".".join(classnames)
         name = bin_text_escape(names[-1])
 
-        file = None
-        line = None
-        url = None
-        try:
-            file = report.location[0]
-            if report.location[1] is not None:
-                line = int(report.location[1])
-        except Exception:
-            pass
-        if hasattr(report, "url"):
-            url = getattr(report, "url")
+        file_, line_ = _safe_location(report)
+        url = getattr(report, "url", None) if hasattr(report, "url") else None
 
-        case = _CaseData(
-            classname=classname,
-            name=name,
-            file=file,
-            line=line,
-            url=url,
-        )
+        case = _CaseData(classname=classname, name=name, file=file_, line=line_, url=url)
         self._cases[key] = case
         self._cases_order.append(key)
         return case
 
-    def _append_properties_from_report(self, case: _CaseData, report: TestReport) -> None:
-        for k, v in (getattr(report, "user_properties", None) or []):
-            case.properties.append({"name": str(k), "value": bin_text_escape(v)})
+    def _append_properties_from_report(self, case: _CaseData, report: Any) -> None:
+        try:
+            props = getattr(report, "user_properties", None) or []
+            for k, v in props:
+                case.properties.append({"name": str(k), "value": bin_text_escape(v)})
+        except Exception:
+            pass
 
     def _prepare_content(self, content: str, header: str) -> str:
         return "\n".join([header.center(80, "-"), content, ""])
 
-    def _write_captured_output(self, case: _CaseData, report: TestReport) -> None:
-        if not self.log_passing_tests and report.passed:
-            return
+    def _write_captured_output(self, case: _CaseData, report: Any) -> None:
+        try:
+            if (not self.log_passing_tests) and getattr(report, "passed", False):
+                return
+        except Exception:
+            pass
+
         if self.logging == "no":
             return
 
@@ -432,11 +553,11 @@ class LogJUnitJSON:
         out_buf = ""
         err_buf = ""
 
-        if self.logging in ["log", "all"]:
+        if self.logging in ("log", "all"):
             out_buf += self._prepare_content(content_log, " Captured Log ")
-        if self.logging in ["system-out", "out-err", "all"]:
+        if self.logging in ("system-out", "out-err", "all"):
             out_buf += self._prepare_content(content_out, " Captured Out ")
-        if self.logging in ["system-err", "out-err", "all"]:
+        if self.logging in ("system-err", "out-err", "all"):
             err_buf += self._prepare_content(content_err, " Captured Err ")
 
         if out_buf:
@@ -444,33 +565,44 @@ class LogJUnitJSON:
         if err_buf:
             case.system_err = (case.system_err or "") + bin_text_escape(err_buf)
 
-    def update_testcase_duration(self, report: TestReport) -> None:
-        if self.report_duration in {"total", getattr(report, "when", "")}:
-            case = self._get_or_create_case(report)
-            case.time += float(getattr(report, "duration", 0.0) or 0.0)
+    def update_testcase_duration(self, report: Any) -> None:
+        try:
+            when = getattr(report, "when", "")
+            if self.report_duration in ("total", when):
+                case = self._get_or_create_case(report)
+                case.time += float(getattr(report, "duration", 0.0) or 0.0)
+        except Exception:
+            pass
 
-    def on_collectreport(self, report: TestReport) -> None:
-        if report.passed:
+    def on_collectreport(self, report: Any) -> None:
+        try:
+            if getattr(report, "passed", False):
+                return
+        except Exception:
             return
 
         case = self._get_or_create_case(report)
         self.update_testcase_duration(report)
 
-        if report.failed:
-            self.add_stats("error")
-            case.error = {
-                "message": "collection failure",
-                "text": bin_text_escape(getattr(report, "longrepr", "")),
-            }
-        else:
-            self.add_stats("skipped")
-            case.skipped = {
-                "message": "collection skipped",
-                "text": bin_text_escape(getattr(report, "longrepr", "")),
-                "type": "pytest.skip",
-            }
+        try:
+            if getattr(report, "failed", False):
+                self.add_stats("error")
+                case.error = {
+                    "message": "collection failure",
+                    "text": _safe_longrepr_text(getattr(report, "longrepr", "")),
+                }
+            else:
+                self.add_stats("skipped")
+                case.skipped = {
+                    "message": "collection skipped",
+                    "text": _safe_longrepr_text(getattr(report, "longrepr", "")),
+                    "type": "pytest.skip",
+                }
+        except Exception:
+            # If anything goes wrong here, do not crash pytest.
+            pass
 
-    def on_internalerror(self, excrepr: ExceptionRepr) -> None:
+    def on_internalerror(self, excrepr: Any) -> None:
         key = ("internal", None, None)
         if key not in self._cases:
             case = _CaseData(classname="pytest", name="internal")
@@ -478,42 +610,54 @@ class LogJUnitJSON:
             self._cases_order.append(key)
         case = self._cases[key]
         self.add_stats("error")
-        case.error = {"message": "internal error", "text": bin_text_escape(excrepr)}
+        try:
+            case.error = {"message": "internal error", "text": bin_text_escape(excrepr)}
+        except Exception:
+            case.error = {"message": "internal error", "text": ""}
 
-    def on_runtest_logreport(self, report: TestReport) -> None:
-        close_report = None
+    def on_runtest_logreport(self, report: Any) -> None:
+        try:
+            when = getattr(report, "when", "")
+            passed = getattr(report, "passed", False)
+            failed = getattr(report, "failed", False)
+            skipped = getattr(report, "skipped", False)
+        except Exception:
+            return
 
-        if report.passed:
-            if getattr(report, "when", "") == "call":
+        if passed:
+            if when == "call":
                 self.add_stats("passed")
                 case = self._get_or_create_case(report)
                 self._append_properties_from_report(case, report)
 
-        elif report.failed:
-            if getattr(report, "when", "") == "teardown":
-                report_wid = getattr(report, "worker_id", None)
-                report_ii = getattr(report, "item_index", None)
-                close_report = next(
-                    (
-                        rep
-                        for rep in self._open_failed_calls
-                        if (
-                            rep.nodeid == report.nodeid
-                            and getattr(rep, "item_index", None) == report_ii
-                            and getattr(rep, "worker_id", None) == report_wid
-                        )
-                    ),
-                    None,
-                )
-                if close_report:
+        elif failed:
+            # Handle "double-fail" (call failed + teardown failed)
+            close_report = None
+            if when == "teardown":
+                try:
+                    report_wid = getattr(report, "worker_id", None)
+                    report_ii = getattr(report, "item_index", None)
+                except Exception:
+                    report_wid, report_ii = None, None
+
+                for rep in list(self._open_failed_calls):
+                    try:
+                        if rep.nodeid == report.nodeid and getattr(rep, "item_index", None) == report_ii and getattr(rep, "worker_id", None) == report_wid:
+                            close_report = rep
+                            break
+                    except Exception:
+                        continue
+
+                if close_report is not None:
                     self._cnt_double_fail_tests += 1
 
             case = self._get_or_create_case(report)
             self._append_properties_from_report(case, report)
 
-            if getattr(report, "when", "") == "call":
+            if when == "call":
                 self.add_stats("failure")
                 if hasattr(report, "wasxfail"):
+                    # xfail that failed? keep consistent with junitxml-ish semantics
                     self.add_stats("skipped")
                     case.skipped = {
                         "message": "xfail-marked test passes unexpectedly",
@@ -521,38 +665,31 @@ class LogJUnitJSON:
                     }
                 else:
                     longrepr = getattr(report, "longrepr", None)
-                    reprcrash: ReprFileLocation | None = getattr(
-                        longrepr, "reprcrash", None
-                    )
-                    message = (
-                        reprcrash.message
-                        if reprcrash is not None
-                        else str(longrepr)
-                    )
+                    msg = _reprcrash_message(longrepr) or str(longrepr)
                     case.failure = {
-                        "message": bin_text_escape(message),
-                        "text": bin_text_escape(longrepr),
+                        "message": bin_text_escape(msg),
+                        "text": _safe_longrepr_text(longrepr),
                     }
                 self._open_failed_calls.append(report)
 
+                # Capture output for failing tests even if we don't log passing tests
                 if not self.log_passing_tests:
                     self._write_captured_output(case, report)
             else:
+                # setup/teardown failure
                 self.add_stats("error")
                 longrepr = getattr(report, "longrepr", None)
-                reprcrash = getattr(longrepr, "reprcrash", None)
-                reason = reprcrash.message if reprcrash is not None else str(longrepr)
-                when = getattr(report, "when", "")
+                reason = _reprcrash_message(longrepr) or str(longrepr)
                 if when == "teardown":
-                    msg = f'failed on teardown with "{reason}"'
+                    msg = 'failed on teardown with "%s"' % reason
                 else:
-                    msg = f'failed on setup with "{reason}"'
+                    msg = 'failed on setup with "%s"' % reason
                 case.error = {
                     "message": bin_text_escape(msg),
-                    "text": bin_text_escape(longrepr),
+                    "text": _safe_longrepr_text(longrepr),
                 }
 
-        elif report.skipped:
+        elif skipped:
             self.add_stats("skipped")
             case = self._get_or_create_case(report)
             self._append_properties_from_report(case, report)
@@ -567,14 +704,14 @@ class LogJUnitJSON:
                 }
             else:
                 longrepr = getattr(report, "longrepr", None)
-                details = ""
                 skipreason = ""
+                details = ""
                 try:
                     filename, lineno, reason = longrepr
                     skipreason = str(reason)
                     if skipreason.startswith("Skipped: "):
                         skipreason = skipreason[9:]
-                    details = f"{filename}:{lineno}: {skipreason}"
+                    details = "%s:%s: %s" % (filename, lineno, skipreason)
                 except Exception:
                     skipreason = str(longrepr)
                     details = skipreason
@@ -586,135 +723,150 @@ class LogJUnitJSON:
                 }
                 self._write_captured_output(case, report)
 
+        # Duration + captured output at teardown
         self.update_testcase_duration(report)
-
-        if getattr(report, "when", "") == "teardown":
+        if when == "teardown":
             case = self._get_or_create_case(report)
             self._write_captured_output(case, report)
 
-            report_wid = getattr(report, "worker_id", None)
-            report_ii = getattr(report, "item_index", None)
-            close_report = next(
-                (
-                    rep
-                    for rep in self._open_failed_calls
-                    if (
-                        rep.nodeid == report.nodeid
-                        and getattr(rep, "item_index", None) == report_ii
-                        and getattr(rep, "worker_id", None) == report_wid
-                    )
-                ),
-                None,
+            # close open failed call record
+            try:
+                report_wid = getattr(report, "worker_id", None)
+                report_ii = getattr(report, "item_index", None)
+                for rep in list(self._open_failed_calls):
+                    if rep.nodeid == report.nodeid and getattr(rep, "item_index", None) == report_ii and getattr(rep, "worker_id", None) == report_wid:
+                        self._open_failed_calls.remove(rep)
+                        break
+            except Exception:
+                pass
+
+    def on_sessionfinish(self, session: Any, exitstatus: int) -> None:
+        try:
+            if self._suite_start is None:
+                self._suite_start = _new_instant()
+
+            duration = self._suite_start.elapsed()
+            # as_utc might not exist on some objects, but ours does
+            try:
+                timestamp = self._suite_start.as_utc().astimezone().isoformat()
+            except Exception:
+                timestamp = datetime.datetime.utcnow().isoformat()
+
+            numtests = (
+                int(self.stats.get("passed", 0))
+                + int(self.stats.get("failure", 0))
+                + int(self.stats.get("skipped", 0))
+                + int(self.stats.get("error", 0))
+                - int(self._cnt_double_fail_tests)
             )
-            if close_report:
-                self._open_failed_calls.remove(close_report)
 
-    def on_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
-        dirname = os.path.dirname(os.path.abspath(self.logfile))
-        os.makedirs(dirname, exist_ok=True)
+            testcases = []  # type: List[Dict[str, Any]]
+            for key in self._cases_order:
+                case = self._cases[key]
+                tc = {
+                    "classname": case.classname,
+                    "name": case.name,
+                    "time": float("%.3f" % case.time),
+                }
 
-        if self._suite_start is None:
-            self._suite_start = _new_instant()
+                if self.family == "xunit1":
+                    if case.file is not None:
+                        tc["file"] = case.file
+                    if case.line is not None:
+                        tc["line"] = case.line
+                    if case.url is not None:
+                        tc["url"] = case.url
 
-        duration = self._suite_start.elapsed()
-        timestamp = self._suite_start.as_utc().astimezone().isoformat()
+                if case.properties:
+                    tc["properties"] = list(case.properties)
 
-        numtests = (
-            self.stats["passed"]
-            + self.stats["failure"]
-            + self.stats["skipped"]
-            + self.stats["error"]
-            - self._cnt_double_fail_tests
-        )
+                if case.skipped is not None:
+                    tc["skipped"] = case.skipped
+                if case.failure is not None:
+                    tc["failure"] = case.failure
+                if case.error is not None:
+                    tc["error"] = case.error
 
-        testcases: list[dict[str, Any]] = []
-        for key in self._cases_order:
-            case = self._cases[key]
-            tc: dict[str, Any] = {
-                "classname": case.classname,
-                "name": case.name,
-                "time": float(f"{case.time:.3f}"),
+                if case.system_out:
+                    tc["system-out"] = case.system_out
+                if case.system_err:
+                    tc["system-err"] = case.system_err
+
+                testcases.append(tc)
+
+            suite = {
+                "name": self.suite_name,
+                "errors": int(self.stats.get("error", 0)),
+                "failures": int(self.stats.get("failure", 0)),
+                "skipped": int(self.stats.get("skipped", 0)),
+                "tests": int(numtests),
+                "time": float("%.3f" % float(getattr(duration, "seconds", 0.0) or 0.0)),
+                "timestamp": timestamp,
+                "hostname": platform.node(),
             }
 
-            if self.family == "xunit1":
-                if case.file is not None:
-                    tc["file"] = case.file
-                if case.line is not None:
-                    tc["line"] = case.line
-                if case.url is not None:
-                    tc["url"] = case.url
+            if self.global_properties:
+                suite["properties"] = [{"name": k, "value": v} for (k, v) in self.global_properties]
 
-            if case.properties:
-                tc["properties"] = list(case.properties)
+            suite["testcase"] = testcases
 
-            if case.skipped is not None:
-                tc["skipped"] = case.skipped
-            if case.failure is not None:
-                tc["failure"] = case.failure
-            if case.error is not None:
-                tc["error"] = case.error
+            doc = {
+                "testsuites": {"name": "pytest tests", "testsuite": suite},
+                "meta": {"exitstatus": int(exitstatus)},
+            }
+            if self.meta:
+                doc["meta"]["custom"] = dict(self.meta)
 
-            if case.system_out:
-                tc["system-out"] = case.system_out
-            if case.system_err:
-                tc["system-err"] = case.system_err
+            with _safe_open_file(self.logfile, self.append) as f:
+                if self.ndjson:
+                    json.dump(doc, f, ensure_ascii=False)
+                    f.write("\n")
+                else:
+                    json.dump(doc, f, ensure_ascii=False, indent=2)
+                    f.write("\n")
+        except Exception:
+            # Never crash pytest at session end because reporting failed.
+            return
 
-            testcases.append(tc)
+    def on_terminal_summary(self, terminalreporter: Any, config: Any) -> None:
+        try:
+            verbosity = _get_config_verbosity(config)
+            if verbosity < 0:
+                return
 
-        suite: dict[str, Any] = {
-            "name": self.suite_name,
-            "errors": int(self.stats["error"]),
-            "failures": int(self.stats["failure"]),
-            "skipped": int(self.stats["skipped"]),
-            "tests": int(numtests),
-            "time": float(f"{duration.seconds:.3f}"),
-            "timestamp": timestamp,
-            "hostname": platform.node(),
-        }
-
-        if self.global_properties:
-            suite["properties"] = [
-                {"name": k, "value": v} for (k, v) in self.global_properties
-            ]
-
-        suite["testcase"] = testcases
-
-        doc: dict[str, Any] = {
-            "testsuites": {"name": "pytest tests", "testsuite": suite},
-            "meta": {"exitstatus": int(exitstatus)},
-        }
-        if self.meta:
-            doc["meta"]["custom"] = dict(self.meta)
-
-        mode = "a" if self.append else "w"
-        with open(self.logfile, mode, encoding="utf-8") as f:
-            if self.ndjson:
-                json.dump(doc, f, ensure_ascii=False)
-                f.write("\n")
-            else:
-                json.dump(doc, f, ensure_ascii=False, indent=2)
-                f.write("\n")
-
-    def on_terminal_summary(self, terminalreporter: TerminalReporter, config: Config) -> None:
-        if config.get_verbosity() >= 0:
             suffix = ""
             if self.ndjson:
                 suffix += " (ndjson)"
             if self.append:
                 suffix += " (append)"
-            terminalreporter.write_sep("-", f"generated json file: {self.logfile}{suffix}")
-            if self.append and not self.ndjson:
-                terminalreporter.write_line(
-                    "NOTE: --junit-json-append without --junit-json-ndjson appends multiple "
-                    "JSON documents to one file (not valid single-JSON). Prefer NDJSON."
-                )
+
+            try:
+                terminalreporter.write_sep("-", "generated json file: %s%s" % (self.logfile, suffix))
+            except Exception:
+                # very old terminal reporter
+                try:
+                    terminalreporter.write_line("generated json file: %s%s" % (self.logfile, suffix))
+                except Exception:
+                    pass
+
+            if self.append and (not self.ndjson):
+                try:
+                    terminalreporter.write_line(
+                        "NOTE: --junit-json-append without --junit-json-ndjson appends multiple "
+                        "JSON documents to one file (not valid single-JSON). Prefer NDJSON."
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            # Never crash pytest because summary printing failed.
+            return
 
 
 # -----------------------------------------------------------------------------
 # Options + config
 # -----------------------------------------------------------------------------
-def _parse_kv(pairs: list[str]) -> list[tuple[str, object]]:
-    out: list[tuple[str, object]] = []
+def _parse_kv(pairs: List[str]) -> List[Tuple[str, object]]:
+    out = []  # type: List[Tuple[str, object]]
     for p in pairs:
         if "=" not in p:
             out.append((p, ""))
@@ -724,130 +876,215 @@ def _parse_kv(pairs: list[str]) -> list[tuple[str, object]]:
     return out
 
 
-def pytest_addoption(parser: Parser) -> None:
-    group = parser.getgroup("terminal reporting")
-    group.addoption(
-        "--junit-json",
-        action="store",
-        dest="junitjson_path",
-        metavar="path",
-        type=functools.partial(filename_arg, optname="--junit-json"),
-        default=None,
-        help="Create junit-like JSON report file at given path",
-    )
-    group.addoption(
-        "--junit-json-meta",
-        action="append",
-        dest="junitjson_meta",
-        default=[],
-        metavar="k=v",
-        help="Add custom meta key/value to JSON (repeatable). "
-        "Values auto-parse true/false/null/int/float; otherwise kept as string.",
-    )
-    group.addoption(
-        "--junit-json-ndjson",
-        action="store_true",
-        dest="junitjson_ndjson",
-        default=False,
-        help="Write report as NDJSON (one JSON object per line; one line per run).",
-    )
-    group.addoption(
-        "--junit-json-append",
-        action="store_true",
-        dest="junitjson_append",
-        default=False,
-        help="Append to existing --junit-json file (intended for NDJSON).",
-    )
+def pytest_addoption(parser: Any) -> None:
+    group = None
+    try:
+        group = parser.getgroup("terminal reporting")
+    except Exception:
+        group = parser
 
-    parser.addini("junit_suite_name", "Test suite name", default="pytest")
-    parser.addini(
-        "junit_logging",
-        "Captured logging in report: one of no|log|system-out|system-err|out-err|all",
-        default="no",
-    )
-    parser.addini(
-        "junit_log_passing_tests",
-        "Capture log information for passing tests: ",
-        type="bool",
-        default=True,
-    )
-    parser.addini(
-        "junit_duration_report",
-        "Duration time to report: one of total|call",
-        default="total",
-    )
-    parser.addini(
-        "junit_family",
-        "Emit JSON similar to JUnit family: one of legacy|xunit1|xunit2",
-        default="xunit2",
-    )
+    def _filename_type(x: str) -> str:
+        # If pytest provides filename_arg use it; else accept raw string.
+        if filename_arg is not None:
+            try:
+                return filename_arg(x, optname="--junit-json")  # type: ignore[misc]
+            except Exception:
+                return x
+        return x
+
+    try:
+        group.addoption(
+            "--junit-json",
+            action="store",
+            dest="junitjson_path",
+            metavar="path",
+            type=functools.partial(_filename_type),
+            default=None,
+            help="Create junit-like JSON report file at given path",
+        )
+    except Exception:
+        # older parser APIs: try again with minimal args
+        try:
+            group.addoption("--junit-json", action="store", dest="junitjson_path", default=None)
+        except Exception:
+            pass
+
+    try:
+        group.addoption(
+            "--junit-json-meta",
+            action="append",
+            dest="junitjson_meta",
+            default=[],
+            metavar="k=v",
+            help="Add custom meta key/value to JSON (repeatable). "
+            "Values auto-parse true/false/null/int/float; otherwise kept as string.",
+        )
+    except Exception:
+        pass
+
+    try:
+        group.addoption(
+            "--junit-json-ndjson",
+            action="store_true",
+            dest="junitjson_ndjson",
+            default=False,
+            help="Write report as NDJSON (one JSON object per line; one line per run).",
+        )
+    except Exception:
+        pass
+
+    try:
+        group.addoption(
+            "--junit-json-append",
+            action="store_true",
+            dest="junitjson_append",
+            default=False,
+            help="Append to existing --junit-json file (intended for NDJSON).",
+        )
+    except Exception:
+        pass
+
+    # INI options; tolerate missing addini on very old pytest
+    try:
+        parser.addini("junit_suite_name", "Test suite name", default="pytest")
+        parser.addini(
+            "junit_logging",
+            "Captured logging in report: one of no|log|system-out|system-err|out-err|all",
+            default="no",
+        )
+        parser.addini(
+            "junit_log_passing_tests",
+            "Capture log information for passing tests",
+            type="bool",
+            default=True,
+        )
+        parser.addini(
+            "junit_duration_report",
+            "Duration time to report: one of total|call",
+            default="total",
+        )
+        parser.addini(
+            "junit_family",
+            "Emit JSON similar to JUnit family: one of legacy|xunit1|xunit2",
+            default="xunit2",
+        )
+    except Exception:
+        pass
 
 
-def pytest_configure(config: Config) -> None:
-    path = getattr(config.option, "junitjson_path", None)
-    if path and not hasattr(config, "workerinput"):
+def _ini_get(config: Any, name: str, default: Any) -> Any:
+    try:
+        return config.getini(name)
+    except Exception:
+        return default
+
+
+def pytest_configure(config: Any) -> None:
+    try:
+        path = getattr(getattr(config, "option", None), "junitjson_path", None)
+        if not path:
+            return
+
+        # Avoid writing from xdist workers: workerinput attribute exists in many versions.
+        if hasattr(config, "workerinput"):
+            return
+
         plugin = LogJUnitJSON(
             logfile=path,
-            prefix=getattr(config.option, "junitprefix", None),  # reuse pytest's --junit-prefix
-            suite_name=config.getini("junit_suite_name"),
-            logging_mode=config.getini("junit_logging"),
-            report_duration=config.getini("junit_duration_report"),
-            family=config.getini("junit_family"),
-            log_passing_tests=bool(config.getini("junit_log_passing_tests")),
-            meta_kv=_parse_kv(list(getattr(config.option, "junitjson_meta", []) or [])),
-            ndjson=bool(getattr(config.option, "junitjson_ndjson", False)),
-            append=bool(getattr(config.option, "junitjson_append", False)),
+            prefix=getattr(getattr(config, "option", None), "junitprefix", None),
+            suite_name=_ini_get(config, "junit_suite_name", "pytest"),
+            logging_mode=_ini_get(config, "junit_logging", "no"),
+            report_duration=_ini_get(config, "junit_duration_report", "total"),
+            family=_ini_get(config, "junit_family", "xunit2"),
+            log_passing_tests=bool(_ini_get(config, "junit_log_passing_tests", True)),
+            meta_kv=_parse_kv(list(getattr(getattr(config, "option", None), "junitjson_meta", []) or [])),
+            ndjson=bool(getattr(getattr(config, "option", None), "junitjson_ndjson", False)),
+            append=bool(getattr(getattr(config, "option", None), "junitjson_append", False)),
         )
         _set_active(config, plugin)
+    except Exception:
+        # Never crash pytest during configure; just skip plugin.
+        return
 
 
-def pytest_unconfigure(config: Config) -> None:
-    _del_active(config)
+def pytest_unconfigure(config: Any) -> None:
+    try:
+        _del_active(config)
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
 # Module-level hook implementations (pluggy-safe across versions)
 # -----------------------------------------------------------------------------
-def pytest_sessionstart(session: pytest.Session) -> None:
+def pytest_sessionstart(session: Any) -> None:
     plugin = _get_active()
     if plugin is not None:
-        plugin.on_sessionstart()
+        try:
+            plugin.on_sessionstart()
+        except Exception:
+            pass
 
 
-def pytest_collectreport(report: TestReport) -> None:
+def pytest_collectreport(report: Any) -> None:
     plugin = _get_active()
     if plugin is not None:
-        plugin.on_collectreport(report)
+        try:
+            plugin.on_collectreport(report)
+        except Exception:
+            pass
 
 
-def pytest_internalerror(excrepr: ExceptionRepr) -> None:
+def pytest_internalerror(excrepr: Any) -> None:
     plugin = _get_active()
     if plugin is not None:
-        plugin.on_internalerror(excrepr)
+        try:
+            plugin.on_internalerror(excrepr)
+        except Exception:
+            pass
 
 
-def pytest_runtest_logreport(report: TestReport) -> None:
+def pytest_runtest_logreport(report: Any) -> None:
     plugin = _get_active()
     if plugin is not None:
-        plugin.on_runtest_logreport(report)
+        try:
+            plugin.on_runtest_logreport(report)
+        except Exception:
+            pass
 
 
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+# pytest_sessionfinish signature varies: sometimes (session, exitstatus),
+# sometimes additional args. Accept *args/**kwargs to avoid validation issues.
+def pytest_sessionfinish(session: Any, exitstatus: int, *args: Any, **kwargs: Any) -> None:
     plugin = _get_active()
     if plugin is not None:
-        plugin.on_sessionfinish(session, exitstatus)
+        try:
+            plugin.on_sessionfinish(session, exitstatus)
+        except Exception:
+            pass
 
 
-# IMPORTANT: pluggy validation on older pytest breaks if we declare args
-# that aren't in the hookspec. So we accept *args/**kwargs and recover config.
-def pytest_terminal_summary(terminalreporter: TerminalReporter, *args, **kwargs) -> None:
+# pytest_terminal_summary signature varies widely across versions.
+# Accept *args/**kwargs to avoid pluggy validation mismatch.
+def pytest_terminal_summary(terminalreporter: Any, *args: Any, **kwargs: Any) -> None:
     plugin = _get_active()
     if plugin is None:
         return
 
+    # Newer pytest might pass config=...; older has terminalreporter.config
     config = kwargs.get("config", getattr(terminalreporter, "config", None))
     if config is None:
-        # Extremely old/odd environments: just skip printing.
+        # Some versions pass "config" positionally as second arg, or pass exitstatus
+        if args:
+            # try: if it's a Config-ish object, it will have .option or .getini
+            cand = args[0]
+            if hasattr(cand, "option") or hasattr(cand, "getini") or hasattr(cand, "getini"):
+                config = cand
+
+    if config is None:
         return
 
-    plugin.on_terminal_summary(terminalreporter, config)
+    try:
+        plugin.on_terminal_summary(terminalreporter, config)
+    except Exception:
+        pass
