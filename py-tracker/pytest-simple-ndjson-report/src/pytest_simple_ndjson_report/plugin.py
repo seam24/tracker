@@ -127,7 +127,7 @@ def _longrepr_to_text_and_message(report):
         txt = repr(lr)
 
     if (not msg) and txt:
-        msg = txt.splitlines()[0][:500]
+        msg = "<no message>"
 
     return msg, txt
 
