@@ -4,19 +4,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
 
 
 # ============================================================
 # Utility functions
 # ============================================================
 
-def compute_partition_indices(total: int, njobs: int, jid: int) -> tuple[int, int]:
+def compute_partition_indices(total, njobs, jid):
     if njobs <= 0:
         raise SystemExit("njobs must be >= 1")
     if jid < 0 or jid >= njobs:
@@ -35,43 +33,32 @@ def compute_partition_indices(total: int, njobs: int, jid: int) -> tuple[int, in
     return start, end
 
 
-def run_allow_fail(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None,
-                   log_file: Path | None = None) -> int:
+def run_allow_fail(cmd, cwd=None, env=None) -> int:
     print(f"+ (cwd={cwd}) {' '.join(cmd)}")
-    cwd_s = str(cwd) if cwd is not None else None
-    if log_file:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        with log_file.open("w", encoding="utf-8") as f:
-            proc = subprocess.run(cmd, cwd=cwd_s, stdout=f, stderr=subprocess.STDOUT, env=env)
-    else:
-        proc = subprocess.run(cmd, cwd=cwd_s, env=env)
+    if cwd is not None:
+        cwd = str(cwd)
+
+    proc = subprocess.run(cmd, cwd=cwd, env=env)
 
     if proc.returncode != 0:
         print(f"!! Command exited with {proc.returncode}")
     return proc.returncode
 
 
-def run_or_die(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None,
-               what: str = "command", log_file: Path | None = None) -> int:
-    rc = run_allow_fail(cmd, cwd=cwd, env=env, log_file=log_file)
-    if rc != 0:
-        raise RuntimeError(f"{what} failed with exit code {rc}: {' '.join(cmd)}")
-    return rc
-
-
 def checkout_commit_with_archive(repo_root: Path, commit_hex: str, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
-    p1 = subprocess.Popen(["git", "-C", str(repo_root), "archive", commit_hex], stdout=subprocess.PIPE)
+    p1 = subprocess.Popen(
+        ["git", "-C", str(repo_root), "archive", commit_hex],
+        stdout=subprocess.PIPE,
+    )
     try:
         p2 = subprocess.Popen(["tar", "-xC", str(dest)], stdin=p1.stdout)
-        assert p1.stdout is not None
         p1.stdout.close()
         rc2 = p2.wait()
         rc1 = p1.wait()
     finally:
         if p1.poll() is None:
             p1.wait()
-
     if rc1 != 0 or rc2 != 0:
         raise RuntimeError(f"git archive failed for commit {commit_hex}")
 
@@ -84,11 +71,11 @@ def sanitize_mutant_key(k: str) -> str:
     return k.replace("/", "_").replace("#", "_").replace(".", "_")
 
 
-def get_mutants(commit: str, mutant_history_path: Path) -> list[dict]:
-    with mutant_history_path.open("r", encoding="utf-8") as f:
+def get_mutants(commit: str, mutant_history_path: Path):
+    with mutant_history_path.open("r") as f:
         mhist = json.load(f)
 
-    chosen: list[dict] = []
+    chosen = []
     for key, entry in mhist.items():
         info = entry["info"]
         history = entry["history"]
@@ -103,90 +90,63 @@ def get_mutants(commit: str, mutant_history_path: Path) -> list[dict]:
         if start is None:
             continue
 
-        chosen.append(
-            {
-                "mutant_key": key,
-                "mutant_id": info.get("mutant_id"),
-                "file": info["file"],
-                "module": info.get("module", ""),
-                "op_type": info.get("op_type", ""),
-                "scope": info.get("scope", ""),
-                "start_pos": start,
-                "end_pos": end,
-                "mutant_value": info["mutant_value"],
-                "commit": commit,
-            }
-        )
+        chosen.append({
+            "mutant_key": key,
+            "mutant_id": info["mutant_id"],
+            "file": info["file"],
+            "module": info["module"],
+            "op_type": info["op_type"],
+            "scope": info["scope"],
+            "start_pos": start,
+            "end_pos": end,
+            "mutant_value": info["mutant_value"],
+            "commit": commit,
+        })
     return chosen
 
 
-def coerce_meta_scalar(v: Any) -> str:
+def meta_args_from_dict(meta: dict) -> list[str]:
     """
-    We pass meta via CLI: --junit-json-meta=k=v
-    Keep it stable/portable by stringifying scalars.
+    Convert {"k": v} -> ["--json-report-meta", "k=v", ...]
+    Values are stringified; the plugin will parse int/float if possible.
     """
-    if v is None:
-        return "null"
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (int, float)):
-        return str(v)
-    return str(v)
+    out = []
+    for k, v in meta.items():
+        if v is None:
+            continue
+        out += ["--json-report-meta", f"{k}={v}"]
+    return out
 
 
-# ============================================================
-# Strong environment helpers (like your XML runner)
-# ============================================================
-
-def guess_base_tmp(env: dict[str, str]) -> Path:
-    base = (
-        env.get("TMPDIR")
-        or env.get("SLURM_TMPDIR")
-        or env.get("TEMP")
-        or env.get("TMP")
-        or "/tmp"
-    )
-    p = Path(base)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def maybe_repair_build_toolchain(conda_env: str, env: dict[str, str]) -> None:
+def find_executable(name: str) -> str | None:
     """
-    Best-effort "make installs work across old/new projects".
-    We do NOT fail the run if this fails.
+    Best-effort lookup for tools like `http` / `httpie` / etc.
+    Kept to preserve your 'best tries' behavior for tools that might not exist.
     """
-    # pip/setuptools/packaging are the usual culprits (your canonicalize_version error)
-    run_allow_fail(
-        ["conda", "run", "-n", conda_env, "python", "-m", "pip", "install", "-U",
-         "pip", "setuptools", "wheel", "packaging"],
-        env=env,
-    )
+    return shutil.which(name)
 
 
-def maybe_repair_httpx(conda_env: str, env: dict[str, str]) -> None:
+def ensure_httpie_env_fix(env: dict) -> dict:
     """
-    Optional: If you used to have an 'httpx repair', keep it best-effort.
-    This is intentionally conservative: upgrade httpx + deps.
+    Best-effort fixups for httpie / requests-ish tooling:
+    - deterministic encoding
+    - sandbox-friendly defaults
     """
-    run_allow_fail(
-        ["conda", "run", "-n", conda_env, "python", "-m", "pip", "install", "-U",
-         "httpx", "httpcore", "h11", "anyio", "sniffio", "certifi"],
-        env=env,
-    )
+    e = dict(env)
+    e.setdefault("PYTHONIOENCODING", "utf-8")
+    e.setdefault("LC_ALL", "C.UTF-8")
+    e.setdefault("LANG", "C.UTF-8")
+    return e
 
 
-def should_retry_install_from_error(output_text: str) -> bool:
-    # The exact error you hit:
-    # TypeError: canonicalize_version() got an unexpected keyword argument 'strip_trailing_zero'
-    if "canonicalize_version()" in output_text and "strip_trailing_zero" in output_text:
-        return True
-    # Generic metadata/build failures sometimes fixed by toolchain refresh
-    if "metadata-generation-failed" in output_text:
-        return True
-    if "subprocess-exited-with-error" in output_text and "egg_info" in output_text:
-        return True
-    return False
+def default_ndjson_path(results_root: Path, commit: str, jid: int | None = None) -> Path:
+    """
+    Sequential mode (default): one NDJSON file per commit.
+    Parallel mutant mode (njobs>1): per-job NDJSON file to avoid concurrent appends.
+    """
+    if jid is None:
+        return results_root / f"results_{commit}.ndjson"
+    return results_root / f"results_{commit}_jid{jid}.ndjson"
 
 
 # ============================================================
@@ -194,16 +154,6 @@ def should_retry_install_from_error(output_text: str) -> bool:
 # ============================================================
 
 class BaseCommitRunner:
-    """
-    Strong runner (JSON report) with robustness similar to your XML runner:
-      - sandboxed HOME, XDG_CACHE_HOME, TMPDIR/TEMP/TMP
-      - isolated pytest basetemp inside sandbox
-      - .git ignored on copy
-      - editable install with fatal failure (run_or_die)
-      - best-effort toolchain repair + retry-on-known-install-failure
-      - optional httpx repair
-    """
-
     def __init__(
         self,
         repo_root: Path,
@@ -215,15 +165,9 @@ class BaseCommitRunner:
         sandbox_mode: str,
         test_paths: list[str] | None,
         ignore_paths: list[str] | None,
-        junit_json: Path,
-        ndjson: bool,
-        append: bool,
-        junit_meta: list[str] | None,
-        repair_httpx: bool,
-        repair_build: bool,
-        pip_no_build_isolation: bool,
-        pip_extra_args: list[str] | None,
-        pytest_extra_args: list[str] | None,
+        json_duration: str = "call",
+        ndjson_path: Path | None = None,
+        timeout: int | None = None,
     ):
         self.repo_root = repo_root
         self.commit = commit
@@ -234,204 +178,187 @@ class BaseCommitRunner:
         self.sandbox_mode = sandbox_mode
         self.test_paths = list(test_paths) if test_paths else []
         self.ignore_paths = list(ignore_paths) if ignore_paths else []
+        self.json_duration = json_duration
+        self.ndjson_path = ndjson_path
+        self.timeout = timeout  # pytest-timeout seconds (optional)
 
-        self.junit_json = junit_json
-        self.ndjson = bool(ndjson)
-        self.append = bool(append)
-        self.junit_meta = list(junit_meta) if junit_meta else []
-
-        self.repair_httpx = bool(repair_httpx)
-        self.repair_build = bool(repair_build)
-        self.pip_no_build_isolation = bool(pip_no_build_isolation)
-        self.pip_extra_args = list(pip_extra_args) if pip_extra_args else []
-        self.pytest_extra_args = list(pytest_extra_args) if pytest_extra_args else []
-
-        self.env = os.environ.copy()
-
-        base_tmp = guess_base_tmp(self.env)
-        self.tmp_root = Path(tempfile.mkdtemp(prefix="sandbox-", dir=str(base_tmp)))
+        # Sandbox
+        self.tmp_root = Path(tempfile.mkdtemp(prefix="sandbox-"))
         self.work_dir = self.tmp_root / "work"
         self.home_dir = self.tmp_root / "home"
+
+        # Extra cache dirs inside sandbox
         self.cache_dir = self.tmp_root / "cache"
         self.pycache_dir = self.tmp_root / "pycache"
         self.pytest_basetemp_root = self.tmp_root / "pytest_basetemp"
 
-    # ----------------------------
-    # command helpers
-    # ----------------------------
-    def _pip(self) -> list[str]:
-        return ["conda", "run", "-n", self.conda_env, "python", "-m", "pip"]
+        self.env = os.environ.copy()
 
-    def _pytest(self) -> list[str]:
-        return ["conda", "run", "-n", self.conda_env, "python", "-m", "pytest"]
-
-    # ----------------------------
-    # sandbox env
-    # ----------------------------
     def prepare_environment(self):
         self.home_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.pycache_dir.mkdir(parents=True, exist_ok=True)
         self.pytest_basetemp_root.mkdir(parents=True, exist_ok=True)
 
+        # Isolate HOME
         self.env["HOME"] = str(self.home_dir)
+
+        # Keep common caches inside sandbox
         self.env["XDG_CACHE_HOME"] = str(self.cache_dir)
+
+        # Make python bytecode deterministic / isolated
         self.env["PYTHONDONTWRITEBYTECODE"] = "1"
         self.env["PYTHONPYCACHEPREFIX"] = str(self.pycache_dir)
 
-        # make tmp usage consistent across tools
-        self.env["TMPDIR"] = str(self.tmp_root)
-        self.env["TEMP"] = str(self.tmp_root)
-        self.env["TMP"] = str(self.tmp_root)
+        # Keep best-effort environment tweaks
+        self.env = ensure_httpie_env_fix(self.env)
 
-        print(f"+ Sandbox root: {self.tmp_root}")
-        print(f"+ Work dir: {self.work_dir}")
         print(f"+ Isolated HOME: {self.home_dir}")
         print(f"+ Isolated XDG_CACHE_HOME: {self.cache_dir}")
+        print(f"+ Isolated PYTHONPYCACHEPREFIX: {self.pycache_dir}")
 
-    # ----------------------------
-    # checkout
-    # ----------------------------
+    def uninstall_package(self):
+        if not self.pkg_name:
+            return
+        run_allow_fail(
+            ["conda", "run", "-n", self.conda_env, "python", "-m", "pip", "uninstall", "-y", self.pkg_name],
+            env=self.env,
+        )
+
     def checkout(self):
-        ignore = shutil.ignore_patterns(".git", ".gitignore", ".gitmodules", ".github", ".gitlab*")
-
         if self.use_head:
-            shutil.copytree(self.repo_root, self.work_dir, ignore=ignore)
+            shutil.copytree(self.repo_root, self.work_dir)
             return
 
         if self.sandbox_mode == "archive":
             checkout_commit_with_archive(self.repo_root, self.commit, self.work_dir)
         elif self.sandbox_mode == "copy":
-            shutil.copytree(self.repo_root, self.work_dir, ignore=ignore)
+            shutil.copytree(self.repo_root, self.work_dir)
         elif self.sandbox_mode == "symlink":
-            shutil.copytree(
-                self.repo_root,
-                self.work_dir,
-                copy_function=os.symlink,
-                ignore=ignore,
-                dirs_exist_ok=True,
-            )
+            shutil.copytree(self.repo_root, self.work_dir, copy_function=os.symlink, dirs_exist_ok=True)
         else:
             raise ValueError(f"Unknown sandbox_mode: {self.sandbox_mode}")
-
-    # ----------------------------
-    # install/uninstall
-    # ----------------------------
-    def uninstall_package(self):
-        if not self.pkg_name:
-            return
-        run_allow_fail(self._pip() + ["uninstall", "-y", self.pkg_name], env=self.env)
-
-    def _set_pythonpath_for_editable(self):
-        prev_pp = self.env.get("PYTHONPATH", "")
-        self.env["PYTHONPATH"] = f"{self.work_dir}{os.pathsep}{prev_pp}" if prev_pp else str(self.work_dir)
 
     def install_package(self):
         if not self.pkg_name:
             return
+        run_allow_fail(
+            ["conda", "run", "-n", self.conda_env, "python", "-m", "pip", "install", "-e", "."],
+            cwd=self.work_dir,
+            env=self.env,
+        )
 
-        self._set_pythonpath_for_editable()
-
-        if self.repair_build:
-            maybe_repair_build_toolchain(self.conda_env, self.env)
-
-        if self.repair_httpx:
-            maybe_repair_httpx(self.conda_env, self.env)
-
-        install_cmd = self._pip() + ["install", "-e", "."]
-        if self.pip_no_build_isolation:
-            install_cmd.append("--no-build-isolation")
-        install_cmd += self.pip_extra_args
-
-        # Try once; if it fails with known toolchain mismatch, repair + retry.
-        log_path = self.tmp_root / "pip_install.log"
-        rc = run_allow_fail(install_cmd, cwd=self.work_dir, env=self.env, log_file=log_path)
-        if rc == 0:
-            return
-
-        txt = ""
+    # ----------------------------
+    # Cache nuking (best effort)
+    # ----------------------------
+    def _rm_tree(self, p: Path):
         try:
-            txt = log_path.read_text(encoding="utf-8", errors="ignore")
+            if p.is_dir() and not p.is_symlink():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
         except Exception:
             pass
 
-        if should_retry_install_from_error(txt):
-            print("+ pip install failed with known pattern; attempting toolchain refresh and retry")
-            maybe_repair_build_toolchain(self.conda_env, self.env)
-            if self.repair_httpx:
-                maybe_repair_httpx(self.conda_env, self.env)
-            run_or_die(install_cmd, cwd=self.work_dir, env=self.env, what="pip install -e . (retry)", log_file=log_path)
-        else:
-            # fatal like XML runner
-            raise RuntimeError(f"pip install -e . failed (see {log_path})")
+    def clear_workdir_caches(self):
+        if not self.work_dir.exists():
+            return
 
-    # ----------------------------
-    # pytest cmd
-    # ----------------------------
-    def _make_basetemp(self, tag: str) -> Path:
-        p = self.pytest_basetemp_root / tag
-        if p.exists():
-            shutil.rmtree(p, ignore_errors=True)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        self._rm_tree(self.work_dir / ".pytest_cache")
 
-    def pytest_cmd(self, basetemp_tag: str, meta: dict[str, Any], extra_args: list[str] | None = None) -> list[str]:
-        ignore_args: list[str] = []
+        for d in self.work_dir.rglob("__pycache__"):
+            self._rm_tree(d)
+
+        for f in self.work_dir.rglob("*.pyc"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+    def clear_global_sandbox_caches(self):
+        self._rm_tree(self.cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self._rm_tree(self.pycache_dir)
+        self.pycache_dir.mkdir(parents=True, exist_ok=True)
+
+        self._rm_tree(self.pytest_basetemp_root)
+        self.pytest_basetemp_root.mkdir(parents=True, exist_ok=True)
+
+    def clear_ndjson_file(self, ndjson_path: Path):
+        """
+        Clear the NDJSON output once at the start of a sequence so the next
+        append writes the first line (program).
+        """
+        try:
+            ndjson_path.unlink()
+        except Exception:
+            pass
+
+    def conda_pytest(
+        self,
+        pytest_args: list[str],
+        *,
+        cwd=None,
+        run_tag: str = "run",
+        ndjson_path: Path | None = None,
+        json_meta: dict | None = None,
+        json_append: bool = True,
+    ) -> int:
+        """
+        Run pytest with cache-clearing + unique basetemp.
+        Uses your NDJSON plugin as the ONLY output artifact.
+
+        IMPORTANT: In your desired workflow, json_append=True even for the program run.
+        """
+        self.clear_workdir_caches()
+
+        basetemp = self.pytest_basetemp_root / run_tag
+        if basetemp.exists():
+            shutil.rmtree(basetemp, ignore_errors=True)
+        basetemp.mkdir(parents=True, exist_ok=True)
+
+        ignore_args = []
         for p in self.ignore_paths:
             ignore_args += ["--ignore", p]
 
-        basetemp = self._make_basetemp(basetemp_tag)
+        forced = ["--cache-clear", "--basetemp", str(basetemp)]
 
-        # ensure target dir exists (especially if user gave absolute windows-mounted path)
-        self.junit_json.parent.mkdir(parents=True, exist_ok=True)
+        timeout_args = []
+        if self.timeout is not None:
+            # single token, robust: --timeout=25 (avoids any accidental positional args)
+            try:
+                t = int(self.timeout)
+            except Exception:
+                t = self.timeout
+            timeout_args += [f"--timeout={t}"]
+            print(f"+ pytest-timeout enabled: --timeout={t}")
 
-        junit_args: list[str] = [f"--junit-json={self.junit_json}"]
-        if self.ndjson:
-            junit_args.append("--junit-json-ndjson")
-        if self.append:
-            junit_args.append("--junit-json-append")
-
-        # add user-provided meta pairs, then runner-generated meta
-        all_meta: list[tuple[str, str]] = []
-        for kv in self.junit_meta:
-            if "=" in kv:
-                k, v = kv.split("=", 1)
-                all_meta.append((k, v))
-            else:
-                all_meta.append((kv, ""))
-
-        for k, v in meta.items():
-            all_meta.append((k, coerce_meta_scalar(v)))
-
-        # pass as CLI options
-        for k, v in all_meta:
-            # keep it simple; users can avoid '=' in values if needed
-            junit_args.append(f"--junit-json-meta={k}={v}")
+        report_args = []
+        if ndjson_path is not None:
+            report_args += ["--json-report", str(ndjson_path)]
+            if json_append:
+                report_args += ["--json-report-append"]
+            if self.json_duration:
+                report_args += ["--json-report-duration", str(self.json_duration)]
+            if json_meta:
+                report_args += meta_args_from_dict(json_meta)
 
         cmd = (
-            self._pytest()
-            + ["--cache-clear", "--basetemp", str(basetemp)]
+            ["conda", "run", "-n", self.conda_env, "python", "-m", "pytest"]
+            + forced
             + ignore_args
+            + timeout_args
             + self.test_paths
-            + junit_args
-            + self.pytest_extra_args
+            + report_args
+            + pytest_args
         )
+        return run_allow_fail(cmd, cwd=cwd, env=self.env)
 
-        if extra_args:
-            cmd += extra_args
-
-        return cmd
-
-    # ----------------------------
-    # cleanup
-    # ----------------------------
     def cleanup(self):
-        # mimic XML runner behavior: uninstall then remove sandbox
-        try:
-            if self.pkg_name:
-                self.uninstall_package()
-        finally:
-            shutil.rmtree(self.tmp_root, ignore_errors=True)
+        if self.pkg_name:
+            self.uninstall_package()
+        shutil.rmtree(self.tmp_root, ignore_errors=True)
 
 
 # ============================================================
@@ -439,22 +366,36 @@ class BaseCommitRunner:
 # ============================================================
 
 class ProgramCommitRunner(BaseCommitRunner):
-    def run(self) -> int:
+    def run_program_tests(self):
+        ndjson_path = self.ndjson_path
+        if ndjson_path is None:
+            ndjson_path = default_ndjson_path(self.results_root, self.commit)
+
+        # Clear once so the *first append* becomes the program line.
+        self.clear_ndjson_file(ndjson_path)
+
+        self.program_exit_code = self.conda_pytest(
+            pytest_args=[],
+            cwd=self.work_dir,
+            run_tag=f"program-{self.commit}",
+            ndjson_path=ndjson_path,
+            json_meta={
+                "kind": "program",
+                "commit": self.commit,
+            },
+            json_append=True,
+        )
+
+    def run(self):
         try:
             self.prepare_environment()
             self.uninstall_package()
             self.checkout()
             self.install_package()
 
-            meta = {
-                "mode": "program",
-                "commit": self.commit,
-            }
-            cmd = self.pytest_cmd(basetemp_tag=f"program-{self.commit}", meta=meta)
-            rc = run_allow_fail(cmd, cwd=self.work_dir, env=self.env)
+            self.clear_global_sandbox_caches()
 
-            print(f"+ program rc={rc} junit_json={self.junit_json}")
-            return rc
+            self.run_program_tests()
         finally:
             self.cleanup()
 
@@ -464,73 +405,98 @@ class ProgramCommitRunner(BaseCommitRunner):
 # ============================================================
 
 class MutantCommitRunner(BaseCommitRunner):
-    def __init__(self, *args, mutants: list[dict], program_rc: int, **kwargs):
+    def __init__(self, *args, mutants, **kwargs):
         super().__init__(*args, **kwargs)
         self.mutants = mutants
-        self.program_rc = program_rc
-        self.original_cache: dict[str, str] = {}
+        self.original_cache = {}
+
+        # to be set externally if running "both"
+        # self.program_exit_code
 
     def preload_originals(self):
         for mu in self.mutants:
             rel = Path(mu["file"])
             abs_path = self.work_dir / rel
-            key = rel.as_posix()
-            if key not in self.original_cache:
-                self.original_cache[key] = abs_path.read_text(encoding="utf-8", errors="ignore")
+            if rel.as_posix() not in self.original_cache:
+                self.original_cache[rel.as_posix()] = abs_path.read_text(encoding="utf-8")
 
-    def apply_mutant(self, mu: dict):
+    def apply_mutant(self, mu):
         rel = Path(mu["file"])
         abs_path = self.work_dir / rel
-        key = rel.as_posix()
-        abs_path.write_text(reconstruct_mutant_code(self.original_cache[key], mu), encoding="utf-8")
+        original = self.original_cache[rel.as_posix()]
+        mutated = reconstruct_mutant_code(original, mu)
+        if abs_path.is_symlink():
+            abs_path.unlink()
+        abs_path.write_text(mutated, encoding="utf-8")
 
-    def restore(self, mu: dict):
+    def restore(self, mu):
         rel = Path(mu["file"])
         abs_path = self.work_dir / rel
-        key = rel.as_posix()
-        abs_path.write_text(self.original_cache[key], encoding="utf-8")
+        original = self.original_cache[rel.as_posix()]
+        if abs_path.is_symlink():
+            abs_path.unlink()
+        abs_path.write_text(original, encoding="utf-8")
 
-    def run(self) -> None:
-        # keep your old gating logic
-        if self.program_rc not in (0, 1):
-            print(f"+ skipping mutants (program rc={self.program_rc})")
-            return
+    def run_single_mutant(self, mu):
+        self.apply_mutant(mu)
 
+        ndjson_path = self.ndjson_path
+        if ndjson_path is None:
+            ndjson_path = default_ndjson_path(self.results_root, self.commit)
+
+        safe = sanitize_mutant_key(mu["mutant_key"])
+
+        rc = self.conda_pytest(
+            pytest_args=[],
+            cwd=self.work_dir,
+            run_tag=f"mut-{safe}",
+            ndjson_path=ndjson_path,
+            json_meta={
+                "kind": "mutant",
+                "commit": self.commit,
+                "mutant_key": mu.get("mutant_key"),
+                "mutant_id": mu.get("mutant_id"),
+                "file": mu.get("file"),
+                "module": mu.get("module"),
+                "op_type": mu.get("op_type"),
+                "scope": mu.get("scope"),
+            },
+            json_append=True,
+        )
+
+        self.restore(mu)
+        self.clear_workdir_caches()
+        return rc
+
+    def run(self):
         try:
+            # Skip mutants if program exit code was "weird"
+            if hasattr(self, "program_exit_code"):
+                if self.program_exit_code not in (0, 1):
+                    print(
+                        f"+ Skipping mutant mode: program pytest exit code was {self.program_exit_code} "
+                        f"(only 0 or 1 allow mutant runs)."
+                    )
+                    return
+
             self.prepare_environment()
             self.uninstall_package()
             self.checkout()
             self.install_package()
 
+            self.clear_global_sandbox_caches()
+
             self.preload_originals()
 
             for mu in self.mutants:
-                self.apply_mutant(mu)
+                self.run_single_mutant(mu)
 
-                safe = sanitize_mutant_key(mu["mutant_key"])
-                meta = {
-                    "mode": "mutant",
-                    "commit": self.commit,
-                    "mutant_key": mu["mutant_key"],
-                    "mutant_id": mu.get("mutant_id", ""),
-                    "file": mu.get("file", ""),
-                    "op_type": mu.get("op_type", ""),
-                    "scope": mu.get("scope", ""),
-                }
-
-                cmd = self.pytest_cmd(
-                    basetemp_tag=f"mut-{safe}",
-                    meta=meta,
-                )
-                run_allow_fail(cmd, cwd=self.work_dir, env=self.env)
-
-                self.restore(mu)
         finally:
             self.cleanup()
 
 
 # ============================================================
-# CLI
+# Argument parsing
 # ============================================================
 
 def parse_args():
@@ -543,8 +509,11 @@ def parse_args():
     p.add_argument("--results", required=True)
 
     p.add_argument("--run", choices=["program", "mutant", "both"], default="both")
+
     p.add_argument("--tests", nargs="*", default=[])
-    p.add_argument("--ignore", action="append", default=[])
+
+    p.add_argument("--ignore", action="append", default=[],
+                   help="Paths to ignore (passed through to pytest as --ignore)")
 
     p.add_argument("--sandbox-mode", choices=["archive", "copy", "symlink"], default="archive")
     p.add_argument("--use-head", action="store_true")
@@ -552,27 +521,22 @@ def parse_args():
     p.add_argument("--mutant-history")
     p.add_argument("--mutant-limit", type=int)
 
-    p.add_argument("--njobs", type=int, default=1)
-    p.add_argument("--jid", type=int, default=0)
+    p.add_argument("--njobs", type=int, default=1, help="Parallel jobs for mutant mode")
+    p.add_argument("--jid", type=int, default=0, help="Job index for mutant mode")
 
-    # JSON reporter options
-    p.add_argument("--junit-json", required=True, help="Path to JSON report (can be NDJSON).")
-    p.add_argument("--junit-json-ndjson", action="store_true")
-    p.add_argument("--junit-json-append", action="store_true")
-    p.add_argument("--junit-json-meta", action="append", default=[],
-                   help="Extra meta k=v passed through to the plugin (repeatable).")
+    p.add_argument(
+        "--json-duration",
+        choices=["call", "total"],
+        default="call",
+        help="Duration mode stored by the NDJSON report plugin.",
+    )
 
-    # robustness toggles
-    p.add_argument("--repair-build-toolchain", action="store_true",
-                   help="Best-effort upgrade pip/setuptools/packaging before install.")
-    p.add_argument("--repair-httpx", action="store_true",
-                   help="Best-effort upgrade httpx stack before install.")
-    p.add_argument("--pip-no-build-isolation", action="store_true",
-                   help="Pass --no-build-isolation to pip install -e .")
-    p.add_argument("--pip-extra-args", action="append", default=[],
-                   help="Extra args to pip install (repeatable; e.g. --pip-extra-args=--no-deps)")
-    p.add_argument("--pytest-extra-args", action="append", default=[],
-                   help="Extra args to pytest (repeatable; e.g. --pytest-extra-args=-q)")
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="Per-test timeout in seconds (pytest-timeout; passed as --timeout).",
+    )
 
     return p.parse_args()
 
@@ -585,47 +549,32 @@ if __name__ == "__main__":
     args = parse_args()
 
     repo_root = Path(args.repo).resolve()
-    results_root = Path(args.results).resolve()
-    results_root.mkdir(parents=True, exist_ok=True)
-
-    # Resolve junit path strongly (fixes "written somewhere else" confusion)
-    junit_path = Path(args.junit_json).expanduser()
-    if not junit_path.is_absolute():
-        # interpret relative to current working directory, not sandbox cwd
-        junit_path = (Path.cwd() / junit_path).resolve()
-    else:
-        junit_path = junit_path.resolve()
-
+    results_dir = Path(args.results).resolve()
     commit = args.commit
 
-    program_rc = 0
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-    # PROGRAM
+    # Decide output file:
+    # - sequential default (njobs==1): results_<commit>.ndjson
+    # - parallel mutant jobs: results_<commit>_jidX.ndjson
     if args.run in ("program", "both"):
-        prog = ProgramCommitRunner(
-            repo_root=repo_root,
-            commit=commit,
-            conda_env=args.conda_env,
-            pkg_name=args.pkg_name,
-            results_root=results_root,
-            use_head=args.use_head,
-            sandbox_mode=args.sandbox_mode,
-            test_paths=args.tests,
-            ignore_paths=args.ignore,
-            junit_json=junit_path,
-            ndjson=args.junit_json_ndjson,
-            append=args.junit_json_append,
-            junit_meta=args.junit_json_meta,
-            repair_httpx=args.repair_httpx,
-            repair_build=args.repair_build_toolchain,
-            pip_no_build_isolation=args.pip_no_build_isolation,
-            pip_extra_args=args.pip_extra_args,
-            pytest_extra_args=args.pytest_extra_args,
-        )
-        program_rc = prog.run()
+        ndjson_path = default_ndjson_path(results_dir, commit)
+    else:
+        # mutant-only runs: avoid parallel appends to the same file
+        if args.njobs and args.njobs > 1:
+            ndjson_path = default_ndjson_path(results_dir, commit, jid=args.jid)
+        else:
+            ndjson_path = default_ndjson_path(results_dir, commit)
 
-    # MUTANT
+    # Load mutants if needed
+    mutants = []
     if args.run in ("mutant", "both"):
+        if args.njobs < 1:
+            raise SystemExit("--njobs must be >= 1")
+        if args.jid < 0:
+            raise SystemExit("--jid must be >= 0")
+        if args.jid >= args.njobs:
+            raise SystemExit(f"--jid must be < --njobs (got jid={args.jid}, njobs={args.njobs})")
         if not args.mutant_history:
             raise SystemExit("--mutant-history required for mutant mode")
 
@@ -633,31 +582,58 @@ if __name__ == "__main__":
         if args.mutant_limit:
             mutants = mutants[: args.mutant_limit]
 
-        start, end = compute_partition_indices(len(mutants), max(1, args.njobs), args.jid)
-        job_mutants = mutants[start:end]
+    prog = None
 
-        print(f"+ Mutant partition: total={len(mutants)}, njobs={max(1, args.njobs)}, jid={args.jid}, this_job={len(job_mutants)}")
-
-        mut = MutantCommitRunner(
-            repo_root=repo_root,
-            commit=commit,
-            conda_env=args.conda_env,
-            pkg_name=args.pkg_name,
-            results_root=results_root,
+    # -------------------------------
+    # Run PROGRAM mode
+    # -------------------------------
+    if args.run in ("program", "both"):
+        prog = ProgramCommitRunner(
+            repo_root,
+            commit,
+            args.conda_env,
+            args.pkg_name,
+            results_dir,
             use_head=args.use_head,
             sandbox_mode=args.sandbox_mode,
             test_paths=args.tests,
             ignore_paths=args.ignore,
-            junit_json=junit_path,
-            ndjson=args.junit_json_ndjson,
-            append=args.junit_json_append,
-            junit_meta=args.junit_json_meta,
-            repair_httpx=args.repair_httpx,
-            repair_build=args.repair_build_toolchain,
-            pip_no_build_isolation=args.pip_no_build_isolation,
-            pip_extra_args=args.pip_extra_args,
-            pytest_extra_args=args.pytest_extra_args,
-            mutants=job_mutants,
-            program_rc=program_rc,
+            json_duration=args.json_duration,
+            ndjson_path=ndjson_path,
+            timeout=args.timeout,
         )
+        prog.run()
+
+    # -------------------------------
+    # Run MUTANT mode
+    # -------------------------------
+    if args.run in ("mutant", "both"):
+        njobs = max(1, args.njobs)
+        jid = args.jid
+
+        total = len(mutants)
+        start, end = compute_partition_indices(total, njobs, jid)
+        job_mutants = mutants[start:end]
+
+        print(f"+ Mutant partition: total={total}, njobs={njobs}, jid={jid}, this_job={len(job_mutants)}")
+
+        mut = MutantCommitRunner(
+            repo_root,
+            commit,
+            args.conda_env,
+            args.pkg_name,
+            results_dir,
+            mutants=job_mutants,
+            use_head=args.use_head,
+            sandbox_mode=args.sandbox_mode,
+            test_paths=args.tests,
+            ignore_paths=args.ignore,
+            json_duration=args.json_duration,
+            ndjson_path=ndjson_path,
+            timeout=args.timeout,
+        )
+
+        if args.run == "both" and prog is not None:
+            mut.program_exit_code = getattr(prog, "program_exit_code", None)
+
         mut.run()
