@@ -83,11 +83,18 @@ RE_HEX_ADDR = re.compile(r"\b0x[0-9a-fA-F]+\b")
 RE_HEX_ESCAPE = re.compile(r"\\x[0-9a-fA-F]{2}")
 
 
-def normalize_hex_noise(msg: str | None) -> str:
+
+RE_SANDBOX_ID = re.compile(r"sandbox-[A-Za-z0-9_-]+")
+
+def normalize_noise(msg: str | None) -> str:
     if msg is None:
         return ""
+
     s = RE_HEX_ADDR.sub(HEX_TOKEN, msg)
     s = RE_HEX_ESCAPE.sub(HEX_TOKEN, s)
+
+    s = RE_SANDBOX_ID.sub("sandbox-<ID>", s)
+
     return s
 
 
@@ -99,8 +106,8 @@ def compare_and_label(program_test: dict | None, mutant_test: dict, flag_incompe
     m_outcome = mutant_test.get("outcome")
 
     # Normalize messages once
-    p_msg = normalize_hex_noise(program_test.get("raw_short_msg"))
-    m_msg = normalize_hex_noise(mutant_test.get("raw_short_msg"))
+    p_msg = normalize_noise(program_test.get("raw_short_msg"))
+    m_msg = normalize_noise(mutant_test.get("raw_short_msg"))
 
     killed = (p_outcome != m_outcome) or (p_msg != m_msg)
     if not killed:
