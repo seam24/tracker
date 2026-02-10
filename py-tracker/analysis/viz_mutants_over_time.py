@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import csv
 from pathlib import Path
 from typing import Any, Dict, Tuple, List, Set, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -20,17 +21,13 @@ BASE = Path("/home/rooti/shared/LatentMu/data/data_from_hpc/thefuck-7b")
 CHRONOLOGICAL = True              # True: oldest->newest, False: newest->oldest
 
 # What to plot
-PLOT_MODE = "count"              # "status" or "counts"
+PLOT_MODE = "status"               # "status" or "count"  (your code uses else for counts)
 
 # Which tests to use
 TEST_MODE = "all"                 # "all" | "baseline" | "new"
-#   all      : use all tests in each commit
-#   baseline : use ONLY tests from oldest commit (T_base)
-#   new      : use ONLY tests added since oldest commit (T' - T_base)
 
 # --- status plot options ---
 SPLIT_INCOMPETENT = True          # if False -> incompetent is counted as killed (red)
-
 ENABLE_FLAKY = True               # classify killed-by-timeouts as "flaky"
 TIMEOUT_PREFIX = "Failed: Timeout"
 
@@ -47,6 +44,14 @@ WRITE_ROW_NORMALIZED = False
 WRITE_ROW_ZSCORE = False
 
 VMAX_PERCENTILE = 99              # for robust vmax in raw counts
+
+# --- CSV saving (NEW) ---
+WRITE_MATRIX_CSV = True
+
+# If you want labels like:
+# unresolved, not_propagated, survived, killed, incompetent, flaky
+# set this to True (only affects status-mode CSV).
+WRITE_STATUS_LABELS_CSV = True
 
 # ============================================================
 
@@ -112,10 +117,87 @@ def choose_xticks(n_cols: int, x_commits: List[str], max_xticks: int = 30):
     return xt, labels
 
 
+def save_numeric_matrix_with_labels_csv(
+    out_path: Path,
+    mat: np.ndarray,
+    row_labels: List[str],
+    col_labels: List[str],
+) -> None:
+    """
+    Numeric CSV (counts mode, or status codes if you want).
+    First col = mutant_id, header = commits.
+    NaN -> empty.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["mutant_id", *col_labels])
+
+        for rid, row in zip(row_labels, mat):
+            vals: List[str] = []
+            for v in row:
+                if isinstance(v, (float, np.floating)) and np.isnan(v):
+                    vals.append("")
+                else:
+                    fv = float(v)
+                    if np.isfinite(fv) and fv.is_integer():
+                        vals.append(str(int(fv)))
+                    else:
+                        vals.append(str(fv))
+            w.writerow([rid, *vals])
+
+    print(f"Wrote CSV: {out_path}")
+
+
+def save_status_labels_csv(
+    out_path: Path,
+    mat: np.ndarray,              # uint8 status code matrix
+    expected: np.ndarray,         # bool matrix (True = expected, False = not propagated)
+    row_labels: List[str],        # mutant_ids
+    col_labels: List[str],        # commits
+) -> None:
+    """
+    Status CSV with the exact labels you requested:
+      unresolved, not_propagated, survived, killed, incompetent, flaky
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    code_to_label = {
+        0: "unresolved",
+        1: "survived",
+        2: "killed",
+        3: "incompetent",
+        4: "flaky",
+    }
+
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["mutant_id", *col_labels])
+
+        n_rows, n_cols = mat.shape
+        assert expected.shape == (n_rows, n_cols)
+
+        for r, rid in enumerate(row_labels):
+            row_out: List[str] = []
+            for c in range(n_cols):
+                if not expected[r, c]:
+                    row_out.append("not_propagated")
+                else:
+                    row_out.append(code_to_label.get(int(mat[r, c]), "unresolved"))
+            w.writerow([rid, *row_out])
+
+    print(f"Wrote CSV: {out_path}")
+
+
 # ------------------------------------------------------------
 # Expected existence (mutant_history prefix logic)
 # ------------------------------------------------------------
-def compute_expected(mutant_ids: List[str], commits_newest_to_oldest: List[str], mutant_history: Dict[str, Any]) -> np.ndarray:
+def compute_expected(
+    mutant_ids: List[str],
+    commits_newest_to_oldest: List[str],
+    mutant_history: Dict[str, Any]
+) -> np.ndarray:
     """
     expected[r,c] in newest->oldest index space, using prefix rule:
       - if mutant not in newest => never expected
@@ -344,8 +426,7 @@ def main() -> None:
 
     # allocate matrices
     if PLOT_MODE == "status":
-        # original status codes
-        # 0 = gray (unresolved)
+        # 0 = unresolved
         # 1 = survived
         # 2 = killed
         # 3 = incompetent (if split)
@@ -390,7 +471,7 @@ def main() -> None:
                     total_tests_mat[r, col] = float(total)
 
     # ------------------------------------------------------------
-    # Plot STATUS (paint not propagated with overlay color)
+    # Plot STATUS
     # ------------------------------------------------------------
     if PLOT_MODE == "status":
         if ENABLE_FLAKY and SPLIT_INCOMPETENT:
@@ -425,7 +506,6 @@ def main() -> None:
 
         # 2) overlay "not propagated" cells with a SOLID color (no hatching)
         if PAINT_NOT_PROPAGATED:
-            # mask where expected=True; keep only (~expected)
             overlay = np.ma.masked_where(expected, np.ones_like(expected, dtype=float))
             ax.imshow(
                 overlay,
@@ -461,6 +541,24 @@ def main() -> None:
         print(f"Wrote: {out}")
         print(f"Matrix size: {n_rows} mutants × {n_cols} commits")
 
+        # --- CSV output (labels + commits + mutants) ---
+        if WRITE_MATRIX_CSV:
+            if WRITE_STATUS_LABELS_CSV:
+                save_status_labels_csv(
+                    BASE / f"mutants_status_labels_tests-{TEST_MODE}.csv",
+                    mat,
+                    expected,
+                    mutant_ids,
+                    x_commits,
+                )
+            else:
+                save_numeric_matrix_with_labels_csv(
+                    BASE / f"mutants_status_codes_tests-{TEST_MODE}.csv",
+                    mat.astype(float),
+                    mutant_ids,
+                    x_commits,
+                )
+
     # ------------------------------------------------------------
     # Plot COUNTS
     # ------------------------------------------------------------
@@ -474,6 +572,8 @@ def main() -> None:
         order = np.argsort(np.nan_to_num(row_max, nan=-1.0))[::-1]
         killed_count_mat = killed_count_mat[order, :]
         total_tests_mat = total_tests_mat[order, :]
+
+        mutant_ids_sorted = [mutant_ids[i] for i in order]
 
         suffix = f"tests-{TEST_MODE}" + ("_masked" if MASK_NOT_EXPECTED_IN_COUNTS else "")
 
@@ -515,6 +615,15 @@ def main() -> None:
             )
 
         print(f"Matrix size: {n_rows} mutants × {n_cols} commits")
+
+        # --- CSV output for counts mode (numeric killed-count matrix) ---
+        if WRITE_MATRIX_CSV:
+            save_numeric_matrix_with_labels_csv(
+                BASE / f"mutants_killed_count_matrix_{suffix}.csv",
+                killed_count_mat,
+                mutant_ids_sorted,
+                x_commits,
+            )
 
     if missing_commits:
         missing_set = set(missing_commits)
