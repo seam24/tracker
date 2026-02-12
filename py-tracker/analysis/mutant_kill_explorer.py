@@ -16,7 +16,7 @@ from plotly.subplots import make_subplots
 # ========================= CONFIG ===========================
 # ============================================================
 
-BASE = Path("/home/rooti/shared/LatentMu/data/data_from_hpc/thefuck-7b")
+BASE = Path("/home/rooti/shared/LatentMu/data/data_from_hpc/thefuck-4b")
 
 COMMITS_FILE = BASE / "commits_to_run.txt"
 RESULTS_DIR = BASE / "with_lbl"
@@ -31,6 +31,11 @@ TEST_MODE = "all"                 # "all" | "baseline" | "new"
 # Count semantics
 COUNT_INCOMPETENT_AS_KILL = False
 
+# NEW: anomalous handling (uses upstream label "anomalous")
+# "count"   -> anomalous tests count toward total, but NOT killed
+# "exclude" -> anomalous tests are removed from BOTH total and killed
+ANOMALOUS_MODE = "exclude"        # "count" | "exclude"
+
 # Mask not expected (optional)
 MASK_NOT_EXPECTED = False
 
@@ -43,12 +48,6 @@ OUT_HTML = BASE / "mutant_kill_explorer.html"
 # Performance / UI
 MAX_X_TICKS = 40                  # for labels; hover still has full
 SHOW_Y_LABELS = False             # y labels are huge; set True only for small sets
-
-# ---- Timeout handling (applies to COUNTING) ----
-TIMEOUT_PREFIX = "Failed: Timeout"
-# "count"   -> timeout-kills are counted as killed (default)
-# "exclude" -> timeout-kill tests are removed from BOTH total and killed
-TIMEOUT_KILL_MODE = "exclude"       # "count" | "exclude"
 
 # ============================================================
 
@@ -124,26 +123,6 @@ def compute_expected(mutant_ids: List[str], commits_newest_to_oldest: List[str],
 
 
 # ------------------------------------------------------------
-# Timeout-aware helpers (mirrors your status logic idea)
-# ------------------------------------------------------------
-def is_timeout(msg: Any) -> bool:
-    return isinstance(msg, str) and msg.startswith(TIMEOUT_PREFIX)
-
-
-def is_timeout_kill(test_obj: Dict[str, Any], program_test_obj: Dict[str, Any]) -> bool:
-    """
-    True iff this test is marked 'killed' AND the short message indicates a timeout
-    on either mutant run or program run.
-    """
-    st = (test_obj.get("status") or "unknown").lower()
-    if st != "killed":
-        return False
-    mmsg = test_obj.get("raw_short_msg")
-    pmsg = (program_test_obj or {}).get("raw_short_msg")
-    return is_timeout(mmsg) or is_timeout(pmsg)
-
-
-# ------------------------------------------------------------
 # Worker
 # ------------------------------------------------------------
 def worker(commit: str, results_path: str, base_tests: Set[str]) -> Tuple[str, Dict[str, Tuple[int, int]], bool]:
@@ -153,7 +132,6 @@ def worker(commit: str, results_path: str, base_tests: Set[str]) -> Tuple[str, D
 
     data = load_json(p)
     mutants = data.get("mutants", {}) or {}
-    program_tests = ((data.get("program") or {}).get("tests") or {})
 
     if TEST_MODE == "all":
         allowed = None
@@ -178,16 +156,15 @@ def worker(commit: str, results_path: str, base_tests: Set[str]) -> Tuple[str, D
         killed = 0
         total = 0
 
-        for tn, t in mtests.items():
-            # Optional exclusion of timeout-kill tests from BOTH total and killed
-            if TIMEOUT_KILL_MODE == "exclude":
-                ptest = (program_tests.get(tn) or {})
-                if is_timeout_kill(t, ptest):
-                    continue
+        for _, t in mtests.items():
+            st = (t.get("status") or "unknown").lower()
+
+            # Exclude anomalous tests entirely if requested
+            if ANOMALOUS_MODE == "exclude" and st == "anomalous":
+                continue
 
             total += 1
 
-            st = (t.get("status") or "unknown").lower()
             if st == "killed":
                 killed += 1
             elif COUNT_INCOMPETENT_AS_KILL and st == "incompetent":
@@ -296,7 +273,7 @@ def main() -> None:
     cc_log1p_killed = col_median_center(log1p_killed)
     cc_log_rate = col_median_center(log_rate)
 
-    # Views
+    # Views (same idea as before)
     views = {
         "killed": (killed, "Killed tests"),
         "rate": (rate, "Kill rate (killed/total)"),
@@ -317,7 +294,7 @@ def main() -> None:
     else:
         y_labels = [str(i) for i in range(n_rows)]
 
-    # Hover context: show mutant id, commit, killed/total (after timeout filtering!), value
+    # Hover context: show mutant id, commit, killed/total AFTER anomalous handling, value
     customdata = np.empty((n_rows, n_cols, 3), dtype=object)
     for r in range(n_rows):
         for c in range(n_cols):
@@ -366,14 +343,14 @@ def main() -> None:
     fig.update_xaxes(tickmode="array", tickvals=[x_labels[i] for i in tick_idx], ticktext=tick_lab, row=1, col=2)
 
     fig.update_layout(
-        title=f"Mutant kill explorer (TEST_MODE={TEST_MODE}, TIMEOUT_KILL_MODE={TIMEOUT_KILL_MODE})",
+        title=f"Mutant kill explorer (TEST_MODE={TEST_MODE}, ANOMALOUS_MODE={ANOMALOUS_MODE})",
         height=800,
         margin=dict(l=40, r=20, t=70, b=40),
     )
 
     # Dropdown menus
     buttons = []
-    for i, name in enumerate(view_names):
+    for name in view_names:
         z, yl = views[name]
         buttons.append(dict(
             label=name,
@@ -381,7 +358,7 @@ def main() -> None:
             args=[
                 {"z": [z, None], "y": [None, z[r0, :]]},
                 {"yaxis2": {"title": yl},
-                 "title": f"Mutant kill explorer — view: {name} (TEST_MODE={TEST_MODE}, TIMEOUT_KILL_MODE={TIMEOUT_KILL_MODE})"},
+                 "title": f"Mutant kill explorer — view: {name} (TEST_MODE={TEST_MODE}, ANOMALOUS_MODE={ANOMALOUS_MODE})"},
             ],
         ))
 
