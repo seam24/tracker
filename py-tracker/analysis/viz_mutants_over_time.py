@@ -15,21 +15,23 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 # ========================= CONFIG ===========================
 # ============================================================
 
-BASE = Path("/home/rooti/shared/LatentMu/data/data_from_hpc/thefuck-7b")
+BASE = Path("/home/rooti/shared/LatentMu/data/data_from_hpc/thefuck-4b")
 
 # X axis order
 CHRONOLOGICAL = True              # True: oldest->newest, False: newest->oldest
 
 # What to plot
-PLOT_MODE = "status"               # "status" or "count"  (your code uses else for counts)
+PLOT_MODE = "status"              # "status" or "count"
 
 # Which tests to use
 TEST_MODE = "all"                 # "all" | "baseline" | "new"
 
 # --- status plot options ---
 SPLIT_INCOMPETENT = True          # if False -> incompetent is counted as killed (red)
-ENABLE_FLAKY = True               # classify killed-by-timeouts as "flaky"
-TIMEOUT_PREFIX = "Failed: Timeout"
+
+# NEW: anomalous status is now produced upstream (labeling script).
+# If False: anomalous will be folded into "killed" for plotting.
+SPLIT_ANOMALOUS = True
 
 # ---- NOT PROPAGATED visualization (NO HATCHING) ----
 PAINT_NOT_PROPAGATED = True
@@ -37,6 +39,7 @@ NOT_PROPAGATED_COLOR = "#f5f5f5"  # overlay color for (~expected) cells
 
 # --- counts plot options (killed-test count heatmaps) ---
 COUNT_INCOMPETENT_AS_KILL = False
+COUNT_ANOMALOUS_AS_KILL = False
 MASK_NOT_EXPECTED_IN_COUNTS = False
 
 WRITE_RAW_COUNTS = True
@@ -49,7 +52,7 @@ VMAX_PERCENTILE = 99              # for robust vmax in raw counts
 WRITE_MATRIX_CSV = True
 
 # If you want labels like:
-# unresolved, not_propagated, survived, killed, incompetent, flaky
+# unresolved, not_propagated, survived, killed, incompetent, anomalous
 # set this to True (only affects status-mode CSV).
 WRITE_STATUS_LABELS_CSV = True
 
@@ -158,8 +161,8 @@ def save_status_labels_csv(
     col_labels: List[str],        # commits
 ) -> None:
     """
-    Status CSV with the exact labels you requested:
-      unresolved, not_propagated, survived, killed, incompetent, flaky
+    Status CSV with labels:
+      unresolved, not_propagated, survived, killed, incompetent, anomalous
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -168,7 +171,7 @@ def save_status_labels_csv(
         1: "survived",
         2: "killed",
         3: "incompetent",
-        4: "flaky",
+        4: "anomalous",
     }
 
     with out_path.open("w", encoding="utf-8", newline="") as f:
@@ -229,35 +232,25 @@ def compute_expected(
 
 
 # ------------------------------------------------------------
-# STATUS logic (+ flaky)
+# STATUS logic (now uses upstream labels: killed/survived/unknown/incompetent/anomalous)
 # ------------------------------------------------------------
-def is_timeout(msg: Any) -> bool:
-    return isinstance(msg, str) and msg.startswith(TIMEOUT_PREFIX)
-
-
-def mutant_status(mtests: Dict[str, Any], program_tests: Dict[str, Any]) -> str:
+def mutant_status(mtests: Dict[str, Any]) -> str:
     """
-    Returns: 'survived' | 'killed' | 'incompetent' | 'flaky' | 'unknown'
+    Returns: 'survived' | 'killed' | 'incompetent' | 'anomalous' | 'unknown'
     """
     if not mtests:
         return "unknown"
 
     sts = [(t.get("status") or "unknown").lower() for t in mtests.values()]
 
+    # Priority: incompetent / anomalous override "killed" (you can swap if you prefer)
     if any(s == "incompetent" for s in sts):
         return "incompetent"
 
-    if any(s == "killed" for s in sts):
-        if ENABLE_FLAKY:
-            killers = [tn for tn, t in mtests.items() if (t.get("status") or "").lower() == "killed"]
-            if killers:
-                def killer_is_timeout(tn: str) -> bool:
-                    mmsg = (mtests.get(tn) or {}).get("raw_short_msg")
-                    pmsg = (program_tests.get(tn) or {}).get("raw_short_msg")
-                    return is_timeout(mmsg) or is_timeout(pmsg)
+    if any(s == "anomalous" for s in sts):
+        return "anomalous"
 
-                if all(killer_is_timeout(tn) for tn in killers):
-                    return "flaky"
+    if any(s == "killed" for s in sts):
         return "killed"
 
     if all(s == "survived" for s in sts):
@@ -276,7 +269,6 @@ def worker(commit: str, results_path: str, base_tests: Set[str]) -> Tuple[str, D
 
     data = load_json(p)
     mutants = data.get("mutants", {}) or {}
-    program_tests = ((data.get("program") or {}).get("tests") or {})
 
     # choose allowed tests for this commit
     if TEST_MODE == "all":
@@ -301,7 +293,7 @@ def worker(commit: str, results_path: str, base_tests: Set[str]) -> Tuple[str, D
         mtests = filter_tests(mtests_full, allowed)
 
         if PLOT_MODE == "status":
-            out[mid] = mutant_status(mtests, program_tests)
+            out[mid] = mutant_status(mtests)
         else:
             total = len(mtests)
             killed = 0
@@ -310,6 +302,8 @@ def worker(commit: str, results_path: str, base_tests: Set[str]) -> Tuple[str, D
                 if st == "killed":
                     killed += 1
                 elif COUNT_INCOMPETENT_AS_KILL and st == "incompetent":
+                    killed += 1
+                elif COUNT_ANOMALOUS_AS_KILL and st == "anomalous":
                     killed += 1
             out[mid] = (killed, total)
 
@@ -430,7 +424,7 @@ def main() -> None:
         # 1 = survived
         # 2 = killed
         # 3 = incompetent (if split)
-        # 4 = flaky
+        # 4 = anomalous (if split)
         mat = np.zeros((n_rows, n_cols), dtype=np.uint8)
     else:
         killed_count_mat = np.full((n_rows, n_cols), np.nan, dtype=float)
@@ -461,8 +455,8 @@ def main() -> None:
                         mat[r, col] = 2
                     elif val == "incompetent":
                         mat[r, col] = 3 if SPLIT_INCOMPETENT else 2
-                    elif val == "flaky":
-                        mat[r, col] = 4
+                    elif val == "anomalous":
+                        mat[r, col] = 4 if SPLIT_ANOMALOUS else 2
                     else:
                         mat[r, col] = 0
                 else:
@@ -474,26 +468,27 @@ def main() -> None:
     # Plot STATUS
     # ------------------------------------------------------------
     if PLOT_MODE == "status":
-        if ENABLE_FLAKY and SPLIT_INCOMPETENT:
+        # Build colormap cases with minimal branching like your original
+        if SPLIT_INCOMPETENT and SPLIT_ANOMALOUS:
             cmap = ListedColormap(["#bdbdbd", "#2ca02c", "#d62728", "#ff7f0e", "#9467bd"])
             bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5]
             ticks = [0, 1, 2, 3, 4]
-            ticklabels = ["unresolved", "survived", "killed", "incompetent", "flaky (timeout kills)"]
-        elif ENABLE_FLAKY and not SPLIT_INCOMPETENT:
-            cmap = ListedColormap(["#bdbdbd", "#2ca02c", "#d62728", "#9467bd"])
-            bounds = [-0.5, 0.5, 1.5, 2.5, 4.5]
-            ticks = [0, 1, 2, 4]
-            ticklabels = ["unresolved", "survived", "killed (incl. incompetent)", "flaky (timeout kills)"]
-        elif (not ENABLE_FLAKY) and SPLIT_INCOMPETENT:
+            ticklabels = ["unresolved", "survived", "killed", "incompetent", "anomalous"]
+        elif SPLIT_INCOMPETENT and (not SPLIT_ANOMALOUS):
             cmap = ListedColormap(["#bdbdbd", "#2ca02c", "#d62728", "#ff7f0e"])
             bounds = [-0.5, 0.5, 1.5, 2.5, 3.5]
             ticks = [0, 1, 2, 3]
-            ticklabels = ["unresolved", "survived", "killed", "incompetent"]
+            ticklabels = ["unresolved", "survived", "killed (incl. anomalous)", "incompetent"]
+        elif (not SPLIT_INCOMPETENT) and SPLIT_ANOMALOUS:
+            cmap = ListedColormap(["#bdbdbd", "#2ca02c", "#d62728", "#9467bd"])
+            bounds = [-0.5, 0.5, 1.5, 2.5, 4.5]
+            ticks = [0, 1, 2, 4]
+            ticklabels = ["unresolved", "survived", "killed (incl. incompetent)", "anomalous"]
         else:
             cmap = ListedColormap(["#bdbdbd", "#2ca02c", "#d62728"])
             bounds = [-0.5, 0.5, 1.5, 2.5]
             ticks = [0, 1, 2]
-            ticklabels = ["unresolved", "survived", "killed (incl. incompetent)"]
+            ticklabels = ["unresolved", "survived", "killed (incl. incompetent/anomalous)"]
 
         norm = BoundaryNorm(bounds, cmap.N)
 
