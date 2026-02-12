@@ -56,15 +56,16 @@ mpl.rcParams["image.resample"] = False
 def mutant_status_from_tests(mtests: Dict[str, Any]) -> str:
     if not mtests:
         return "unknown"
+
     statuses = [(t.get("status") or "unknown").lower() for t in mtests.values()]
 
-    # Priority: incompetent/anomalous override killed for aggregated status
+    # Priority: incompetent > killed > anomalous > survived > unknown
     if any(s == "incompetent" for s in statuses):
         return "incompetent"
-    if any(s == "anomalous" for s in statuses):
-        return "anomalous"
     if any(s == "killed" for s in statuses):
         return "killed"
+    if any(s == "anomalous" for s in statuses):
+        return "anomalous"
     if all(s == "survived" for s in statuses):
         return "survived"
     return "unknown"

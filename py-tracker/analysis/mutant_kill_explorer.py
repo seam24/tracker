@@ -31,9 +31,9 @@ TEST_MODE = "all"                 # "all" | "baseline" | "new"
 # Count semantics
 COUNT_INCOMPETENT_AS_KILL = False
 
-# NEW: anomalous handling (uses upstream label "anomalous")
-# "count"   -> anomalous tests count toward total, but NOT killed
-# "exclude" -> anomalous tests are removed from BOTH total and killed
+# Handling of tests labeled "anomalous":
+# "count"   -> keep anomalous tests in total (but they do not contribute to killed)
+# "exclude" -> remove anomalous tests from BOTH total and killed
 ANOMALOUS_MODE = "exclude"        # "count" | "exclude"
 
 # Mask not expected (optional)
@@ -159,7 +159,6 @@ def worker(commit: str, results_path: str, base_tests: Set[str]) -> Tuple[str, D
         for _, t in mtests.items():
             st = (t.get("status") or "unknown").lower()
 
-            # Exclude anomalous tests entirely if requested
             if ANOMALOUS_MODE == "exclude" and st == "anomalous":
                 continue
 
@@ -273,7 +272,6 @@ def main() -> None:
     cc_log1p_killed = col_median_center(log1p_killed)
     cc_log_rate = col_median_center(log_rate)
 
-    # Views (same idea as before)
     views = {
         "killed": (killed, "Killed tests"),
         "rate": (rate, "Kill rate (killed/total)"),
@@ -294,7 +292,7 @@ def main() -> None:
     else:
         y_labels = [str(i) for i in range(n_rows)]
 
-    # Hover context: show mutant id, commit, killed/total AFTER anomalous handling, value
+    # Hover context: show mutant id, commit, killed/total, value
     customdata = np.empty((n_rows, n_cols, 3), dtype=object)
     for r in range(n_rows):
         for c in range(n_cols):
@@ -343,7 +341,7 @@ def main() -> None:
     fig.update_xaxes(tickmode="array", tickvals=[x_labels[i] for i in tick_idx], ticktext=tick_lab, row=1, col=2)
 
     fig.update_layout(
-        title=f"Mutant kill explorer (TEST_MODE={TEST_MODE}, ANOMALOUS_MODE={ANOMALOUS_MODE})",
+        title=f"Mutant kill explorer (TEST_MODE={TEST_MODE})",
         height=800,
         margin=dict(l=40, r=20, t=70, b=40),
     )
@@ -358,7 +356,7 @@ def main() -> None:
             args=[
                 {"z": [z, None], "y": [None, z[r0, :]]},
                 {"yaxis2": {"title": yl},
-                 "title": f"Mutant kill explorer — view: {name} (TEST_MODE={TEST_MODE}, ANOMALOUS_MODE={ANOMALOUS_MODE})"},
+                 "title": f"Mutant kill explorer — view: {name} (TEST_MODE={TEST_MODE})"},
             ],
         ))
 

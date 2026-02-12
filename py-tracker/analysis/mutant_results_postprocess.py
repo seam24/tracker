@@ -2,7 +2,7 @@
 Read program results, process and store structured more compact data.
 Optionally label mutant test results (killed/survived/unknown) by comparing to program tests.
 
-Feature: you can ENABLE/DISABLE writing the intermediate (extracted) JSON files.
+Feature: one can ENABLE/DISABLE writing the intermediate (extracted) JSON files.
 - If ENABLE_LABELING=True and WRITE_INTERMEDIATE=False:
     no extracted JSON bundle is written (least I/O)
 - If ENABLE_LABELING=True and WRITE_INTERMEDIATE=True:
@@ -14,6 +14,11 @@ Extra feature:
 - If FLAG_INCOMPETENT=True:
     when a mutant would be labeled "killed" and its (normalized) message starts with "TypeError",
     label it as "incompetent" instead.
+
+Extra feature:
+- Anomalous labeling (umbrella):
+    when a mutant would be labeled "killed" and its (normalized) message starts with one of the
+    configured anomalous prefixes, label it as "anomalous" instead.
 
 Output modes (independent switches):
 - WRITE_LABELED_DATA (requires ENABLE_LABELING=True):
@@ -61,7 +66,7 @@ ENABLE_LABELING = True
 # Write outputs
 WRITE_INTERMEDIATE = False        # writes OUT_DIR_EXTRACTED/<out_name>.json (UNLABELED bundle)
 WRITE_LABELED_DATA = True        # writes OUT_DIR_LABELED/<out_name>.json (requires ENABLE_LABELING=True)
-WRITE_LBL_PER_FILE = False        # writes OUT_DIR_LBL_PER_FILE/<commit>/... (works with or without labeling)
+WRITE_LBL_PER_FILE = False       # writes OUT_DIR_LBL_PER_FILE/<commit>/... (works with or without labeling)
 
 # If enabled: killed + message startswith TypeError => incompetent
 FLAG_INCOMPETENT = True
@@ -82,20 +87,44 @@ HEX_TOKEN = "<HEX>"
 RE_HEX_ADDR = re.compile(r"\b0x[0-9a-fA-F]+\b")
 RE_HEX_ESCAPE = re.compile(r"\\x[0-9a-fA-F]{2}")
 
-
+RE_OBJ_REPR_ID = re.compile(r"<[^>]*\bid='[0-9]+'[^>]*>")
+RE_OBJ_HEX_AT = re.compile(r"<[^>]*\bobject at 0x[0-9a-fA-F]+\b[^>]*>")
 
 RE_SANDBOX_ID = re.compile(r"sandbox-[A-Za-z0-9_-]+")
+
+# Umbrella label for unexpected/anomalous run failures
+ANOMALOUS_LABEL = "anomalous"
+ANOMALOUS_PREFIXES = (
+    "OSError",
+    "TimeoutError",
+    "Failed: Timeout",
+    "Resource temporarily unavailable",
+    "Too many open files",
+    "Disk quota exceeded",
+)
+
 
 def normalize_noise(msg: str | None) -> str:
     if msg is None:
         return ""
 
-    s = RE_HEX_ADDR.sub(HEX_TOKEN, msg)
+    # Normalize runtime object repr noise
+    s = RE_OBJ_REPR_ID.sub("<OBJ id='<ID>'>", msg)
+    s = RE_OBJ_HEX_AT.sub("<OBJ at <HEX>>", s)
+
+    # Normalize remaining hex noise
+    s = RE_HEX_ADDR.sub(HEX_TOKEN, s)
     s = RE_HEX_ESCAPE.sub(HEX_TOKEN, s)
 
+    # Normalize sandbox ids
     s = RE_SANDBOX_ID.sub("sandbox-<ID>", s)
 
     return s
+
+
+def is_anomalous_message(msg: str) -> bool:
+    m = (msg or "").lstrip()
+    return m.startswith(ANOMALOUS_PREFIXES)
 
 
 def compare_and_label(program_test: dict | None, mutant_test: dict, flag_incompetent: bool) -> str:
@@ -113,6 +142,11 @@ def compare_and_label(program_test: dict | None, mutant_test: dict, flag_incompe
     if not killed:
         return "survived"
 
+    # NEW: umbrella anomalous classification (only when it would otherwise be "killed")
+    if is_anomalous_message(m_msg):
+        return ANOMALOUS_LABEL
+
+    # Existing: incompetent
     if flag_incompetent:
         m0 = (m_msg or "").lstrip()
         if m0.startswith("TypeError"):
@@ -123,7 +157,7 @@ def compare_and_label(program_test: dict | None, mutant_test: dict, flag_incompe
 
 def label_commit_data_inplace(commit_data: dict, flag_incompetent: bool) -> dict:
     """
-    MUTATES and returns commit_data by adding mt["status"] = killed/survived/unknown/incompetent
+    MUTATES and returns commit_data by adding mt["status"] = killed/survived/unknown/incompetent/anomalous
     for each mutant test, based on the program's corresponding test.
     """
     program_tests = (commit_data.get("program", {}) or {}).get("tests", {}) or {}

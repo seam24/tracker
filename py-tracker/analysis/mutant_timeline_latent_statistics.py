@@ -8,10 +8,18 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 STATUS_INCOMPETENT = "incompetent"
+STATUS_ANOMALOUS = "anomalous"   
 STATUS_KILLED = "killed"
 STATUS_SURVIVED = "survived"
 STATUS_UNKNOWN = "unknown"
-ALL_STATUSES = (STATUS_INCOMPETENT, STATUS_KILLED, STATUS_SURVIVED, STATUS_UNKNOWN)
+
+ALL_STATUSES = (
+    STATUS_INCOMPETENT,
+    STATUS_ANOMALOUS,           
+    STATUS_KILLED,
+    STATUS_SURVIVED,
+    STATUS_UNKNOWN,
+)
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -63,9 +71,10 @@ def status_counts_and_rates_from_tests(mtests: Dict[str, Any]) -> Tuple[Counter,
 
 def overall_mutant_status_priority(mtests: Dict[str, Any]) -> str:
     """
-    Priority rules:
+    Priority rules (recommended):
       - if any incompetent -> incompetent
       - else if any killed -> killed
+      - else if any anomalous -> anomalous
       - else if any survived -> survived (even if some unknown)
       - else unknown
     """
@@ -76,6 +85,8 @@ def overall_mutant_status_priority(mtests: Dict[str, Any]) -> str:
         return STATUS_INCOMPETENT
     if cnt[STATUS_KILLED] > 0:
         return STATUS_KILLED
+    if cnt[STATUS_ANOMALOUS] > 0:
+        return STATUS_ANOMALOUS
     if cnt[STATUS_SURVIVED] > 0:
         return STATUS_SURVIVED
     return STATUS_UNKNOWN
@@ -84,6 +95,7 @@ def overall_mutant_status_priority(mtests: Dict[str, Any]) -> str:
 def killed_by_failing_tests(mutant_md: Dict[str, Any], failing_tests: Set[str]) -> bool:
     """
     True iff this mutant has per-test status 'killed' for at least one failing test id.
+    (NOTE: anomalous does NOT count as killed here.)
     """
     mtests = (mutant_md.get("tests") or {})
     for tid in failing_tests:
@@ -141,7 +153,7 @@ def main() -> None:
     N_WORKERS = 4
     OUT_JSON = base / "mutant_timeline_report.json"
 
-    commits = [ln.strip() for ln in commits_file.read_text(encoding="utf-8").splitlines() if ln.strip()]#[:50]
+    commits = [ln.strip() for ln in commits_file.read_text(encoding="utf-8").splitlines() if ln.strip()]  # [:50]
     if not commits:
         raise SystemExit(f"No commits found in {commits_file}")
 
@@ -163,24 +175,29 @@ def main() -> None:
     for mid, md in head_mutants.items():
         overall = head_summaries.get(mid, {}).get("overall_status", STATUS_UNKNOWN)
         is_killed = (overall == STATUS_KILLED)
+        is_anomalous = (overall == STATUS_ANOMALOUS) 
         killed_by_fail = killed_by_failing_tests(md, failing_tests)
+
         head_flags[mid] = {
             "head_overall_status": overall,
             "head_is_killed": bool(is_killed),
+            "head_is_anomalous": bool(is_anomalous), 
             "head_killed_by_failing_tests": bool(killed_by_fail),
         }
 
     # HEAD overall status counts (per mutant, after priority rule)
     head_overall_counts = Counter(s["overall_status"] for s in head_summaries.values())
     head_incomp = int(head_overall_counts.get(STATUS_INCOMPETENT, 0))
+    head_anom = int(head_overall_counts.get(STATUS_ANOMALOUS, 0)) 
     head_killed = int(head_overall_counts.get(STATUS_KILLED, 0))
     head_survived = int(head_overall_counts.get(STATUS_SURVIVED, 0))
     head_unknown = int(head_overall_counts.get(STATUS_UNKNOWN, 0))
 
-    # HEAD mutation score: killed / (killed + survived), excluding incompetent/unknown
+    # HEAD mutation score: killed / (killed + survived), excluding incompetent/anomalous/unknown
     head_mutation_score = safe_div(head_killed, head_killed + head_survived)
 
-    # Candidate sets for latent definitions (both require overall killed at head, i.e., not incompetent at head)
+    # Candidate sets for latent definitions:
+    # We require overall killed at head (so NOT incompetent/anomalous at head).
     killed_at_head: Set[str] = {mid for mid, f in head_flags.items() if f["head_is_killed"]}
     killed_by_failing_at_head: Set[str] = {
         mid for mid in killed_at_head if head_flags[mid]["head_killed_by_failing_tests"]
@@ -238,6 +255,7 @@ def main() -> None:
                 **head_flags.get(mid, {
                     "head_overall_status": head_entry["overall_status"],
                     "head_is_killed": False,
+                    "head_is_anomalous": False,
                     "head_killed_by_failing_tests": False,
                 }),
             },
@@ -269,7 +287,7 @@ def main() -> None:
             "killed_at_head_count": len(killed_at_head),
             "killed_by_failing_at_head_count": len(killed_by_failing_at_head),
             "mutation_score": head_mutation_score,
-            "mutation_score_definition": "killed / (killed + survived), excluding incompetent and unknown",
+            "mutation_score_definition": "killed / (killed + survived), excluding incompetent, anomalous and unknown",
         },
         "latent_summary": {
             "latent_overall_killed_count": len(latent1),
@@ -283,11 +301,10 @@ def main() -> None:
     print(f"Wrote report: {OUT_JSON}")
     print(f"HEAD: {head}")
 
-    # Now includes all four head counts in the same line:
     print(
         f"HEAD status counts: "
         f"killed={head_killed}, survived={head_survived}, "
-        f"incompetent={head_incomp}, unknown={head_unknown}"
+        f"incompetent={head_incomp}, anomalous={head_anom}, unknown={head_unknown}"
     )
 
     print(f"HEAD mutation score: {head_mutation_score:.4f}  (killed={head_killed}, survived={head_survived})")

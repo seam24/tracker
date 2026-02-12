@@ -237,25 +237,23 @@ def compute_expected(
 def mutant_status(mtests: Dict[str, Any]) -> str:
     """
     Returns: 'survived' | 'killed' | 'incompetent' | 'anomalous' | 'unknown'
+
+    Priority:
+      incompetent > killed > anomalous > survived > unknown
     """
     if not mtests:
         return "unknown"
 
     sts = [(t.get("status") or "unknown").lower() for t in mtests.values()]
 
-    # Priority: incompetent / anomalous override "killed" (you can swap if you prefer)
     if any(s == "incompetent" for s in sts):
         return "incompetent"
-
-    if any(s == "anomalous" for s in sts):
-        return "anomalous"
-
     if any(s == "killed" for s in sts):
         return "killed"
-
+    if any(s == "anomalous" for s in sts):
+        return "anomalous"
     if all(s == "survived" for s in sts):
         return "survived"
-
     return "unknown"
 
 
