@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=latentmu_commit
-#SBATCH --output=/dev/null
-#SBATCH --error=/mnt/aiongpfs/users/trostami/LatentMu/commits/thefuck-4b/logs/commit_%A_%a.err
+#SBATCH --job-name=latentmu_commit_4b_scratch
+#SBATCH --output=/dev/null #/scratch/users/trostami/commits/thefuck-4b/logs/commit_%A_%a.out
+#SBATCH --error=/dev/null #/scratch/users/trostami/commits/thefuck-4b/logs/commit_%A_%a.err
 #SBATCH --array=1-167
 #SBATCH --time=6:00:00
 #SBATCH --cpus-per-task=1
@@ -9,27 +9,34 @@
 
 set -euo pipefail
 
-SRC_DIR="/mnt/aiongpfs/users/trostami/LatentMu/src"
-REPO="/mnt/aiongpfs/users/trostami/LatentMu/commits/thefuck-4b/thefuck"
-RUNNER="${SRC_DIR}/commit_test_runner.py"
+# Scratch base (repo + data + results live here)
+BASE="/scratch/users/trostami/commits/thefuck-4b"
+REPO="${BASE}/thefuck"
+DATA_DIR="${BASE}/data"
+LOGDIR="${BASE}/logs"
 
-# ONE shared output directory for all commits
-RESULTS_BASE="/mnt/aiongpfs/users/trostami/LatentMu/commits/thefuck-4b/data/program_results"
+# Runner code still on GPFS (unless you copy it to scratch)
+RUNNER="/mnt/aiongpfs/users/trostami/LatentMu/src/commit_test_runner.py"
 
-MUTANT_HISTORY="/mnt/aiongpfs/users/trostami/LatentMu/commits/thefuck-4b/data/mutant_history.json"
-COMMITS_FILE="/mnt/aiongpfs/users/trostami/LatentMu/commits/thefuck-4b/data/commits_to_run.txt"
+RESULTS_BASE="${DATA_DIR}/program_results"
+MUTANT_HISTORY="${DATA_DIR}/mutant_history.json"
+COMMITS_FILE="${DATA_DIR}/commits_to_run.txt"
+
 CONDA_ENV="thefuck-32b-env"
-
-PYTEST_TIMEOUT="20"
+PYTEST_TIMEOUT="10"
 TESTS_LIST=""
 IGNORE_LIST=""
 RUN_MODE="both"
 
-mkdir -p "$RESULTS_BASE"
-mkdir -p "/mnt/aiongpfs/users/trostami/LatentMu/commits/thefuck-4b/logs"
+# mkdir -p "$RESULTS_BASE" "$LOGDIR"
+
+# Sanity checks (clear errors)
+[[ -d "$REPO" ]] || { echo "Missing repo dir: $REPO" >&2; exit 2; }
+[[ -f "$RUNNER" ]] || { echo "Missing runner: $RUNNER" >&2; exit 2; }
+[[ -f "$COMMITS_FILE" ]] || { echo "Missing commits file: $COMMITS_FILE" >&2; exit 2; }
+[[ -f "$MUTANT_HISTORY" ]] || { echo "Missing mutant history: $MUTANT_HISTORY" >&2; exit 2; }
 
 source ~/miniconda3/etc/profile.d/conda.sh
-cd "$SRC_DIR"
 
 LINE_NO="${SLURM_ARRAY_TASK_ID}"
 COMMIT="$(sed -n "${LINE_NO}p" "$COMMITS_FILE" || true)"
@@ -45,8 +52,9 @@ if [[ "$COMMIT" == "$HEAD_COMMIT" ]]; then
   EXTRA_HEAD=(--use-head)
 fi
 
-# IMPORTANT: shared output dir
-OUTDIR="$RESULTS_BASE"
+# Per-commit results
+OUTDIR="${RESULTS_BASE}"
+mkdir -p "$OUTDIR"
 
 TIMEOUT_ARG=()
 if [[ -n "${PYTEST_TIMEOUT}" ]]; then
@@ -68,8 +76,9 @@ if [[ -n "${IGNORE_LIST}" ]]; then
 fi
 
 echo "[$SLURM_JOB_ID/$SLURM_ARRAY_TASK_ID] Commit: $COMMIT"
-echo "Results dir (shared): $OUTDIR"
-echo "Run mode: $RUN_MODE"
+echo "Repo: $REPO"
+echo "Results: $OUTDIR"
+echo "Host: $(hostname)"
 
 python "$RUNNER" \
   --repo "$REPO" \
@@ -84,3 +93,4 @@ python "$RUNNER" \
   "${EXTRA_HEAD[@]}"
 
 echo "Done commit $COMMIT."
+
