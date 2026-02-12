@@ -23,10 +23,13 @@ COMMITS_FILE = BASE / "commits_to_run.txt"
 RESULTS_DIR = BASE / "with_lbl"
 MUTANT_HISTORY_PATH = BASE / "mutant_history.json"
 
-REPO_ROOT = Path("/home/rooti/shared/LatentMu/commits/thefuck-4b/thefuck")
+REPO_ROOT = Path("/home/rooti/shared/LatentMu/chk/thefuck-4b/thefuck")
 
 CHRONOLOGICAL = True
 SPLIT_INCOMPETENT = True
+
+# NEW: show anomalous as its own color; if False -> treat as killed (red)
+SPLIT_ANOMALOUS = True
 
 # UI tweaks
 MAX_XTICKS = 30
@@ -54,8 +57,12 @@ def mutant_status_from_tests(mtests: Dict[str, Any]) -> str:
     if not mtests:
         return "unknown"
     statuses = [(t.get("status") or "unknown").lower() for t in mtests.values()]
+
+    # Priority: incompetent/anomalous override killed for aggregated status
     if any(s == "incompetent" for s in statuses):
         return "incompetent"
+    if any(s == "anomalous" for s in statuses):
+        return "anomalous"
     if any(s == "killed" for s in statuses):
         return "killed"
     if all(s == "survived" for s in statuses):
@@ -272,7 +279,7 @@ def main() -> None:
         expected[:, col_of_x[c]] = expected0[:, commit_to_idx0[c]]
 
     # Matrix encoding
-    GRAY, SURVIVED, KILLED, INCOMPETENT = 0, 1, 2, 3
+    GRAY, SURVIVED, KILLED, INCOMPETENT, ANOMALOUS = 0, 1, 2, 3, 4
     mat = np.full((len(mutant_ids), len(x_commits)), GRAY, dtype=np.uint8)
 
     # Build matrix
@@ -294,6 +301,8 @@ def main() -> None:
                     mat[r, col] = KILLED
                 elif st == "incompetent":
                     mat[r, col] = INCOMPETENT if SPLIT_INCOMPETENT else KILLED
+                elif st == "anomalous":
+                    mat[r, col] = ANOMALOUS if SPLIT_ANOMALOUS else KILLED
                 else:
                     mat[r, col] = GRAY
 
@@ -304,8 +313,29 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=220)
 
     # Unresolved color is configurable now
-    cmap = ListedColormap([UNRESOLVED_COLOR, "#2ca02c", "#d62728", "#ff7f0e"])
-    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+    # Colors: unresolved, survived, killed, incompetent, anomalous
+    if SPLIT_INCOMPETENT and SPLIT_ANOMALOUS:
+        cmap = ListedColormap([UNRESOLVED_COLOR, "#2ca02c", "#d62728", "#ff7f0e", "#9467bd"])
+        bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5]
+        ticks = [0, 1, 2, 3, 4]
+        ticklabels = ["unresolved (expected)", "survived", "killed", "incompetent", "anomalous"]
+    elif SPLIT_INCOMPETENT and not SPLIT_ANOMALOUS:
+        cmap = ListedColormap([UNRESOLVED_COLOR, "#2ca02c", "#d62728", "#ff7f0e"])
+        bounds = [-0.5, 0.5, 1.5, 2.5, 3.5]
+        ticks = [0, 1, 2, 3]
+        ticklabels = ["unresolved (expected)", "survived", "killed (incl. anomalous)", "incompetent"]
+    elif not SPLIT_INCOMPETENT and SPLIT_ANOMALOUS:
+        cmap = ListedColormap([UNRESOLVED_COLOR, "#2ca02c", "#d62728", "#9467bd"])
+        bounds = [-0.5, 0.5, 1.5, 2.5, 4.5]
+        ticks = [0, 1, 2, 4]
+        ticklabels = ["unresolved (expected)", "survived", "killed (incl. incompetent)", "anomalous"]
+    else:
+        cmap = ListedColormap([UNRESOLVED_COLOR, "#2ca02c", "#d62728"])
+        bounds = [-0.5, 0.5, 1.5, 2.5]
+        ticks = [0, 1, 2]
+        ticklabels = ["unresolved (expected)", "survived", "killed (incl. incompetent/anomalous)"]
+
+    norm = BoundaryNorm(bounds, cmap.N)
 
     # 1) draw normal status heatmap
     im = ax.imshow(
@@ -331,7 +361,7 @@ def main() -> None:
             alpha=1.0,
         )
 
-    ax.set_title("Click a cell → inspect: kill reason + unified diff")
+    ax.set_title("Click a cell → inspect: status counts + unified diff")
     ax.set_xlabel("Commits")
     ax.set_ylabel("Mutants")
     ax.set_yticks([])
@@ -344,8 +374,8 @@ def main() -> None:
     ax.set_xticks(xt)
     ax.set_xticklabels([x_commits[i][:8] for i in xt], rotation=90, fontsize=7)
 
-    cbar = fig.colorbar(im, ax=ax, ticks=[0, 1, 2, 3], fraction=0.02, pad=0.02)
-    cbar.ax.set_yticklabels(["unresolved (expected)", "survived", "killed", "incompetent"])
+    cbar = fig.colorbar(im, ax=ax, ticks=ticks, fraction=0.02, pad=0.02)
+    cbar.ax.set_yticklabels(ticklabels)
 
     plt.tight_layout()
 
@@ -372,14 +402,15 @@ def main() -> None:
         killers = []
         for tid, td in mtests.items():
             st = (td.get("status") or "unknown").lower()
-            if st in ("killed", "incompetent"):
+            # include anomalous too (umbrella)
+            if st in ("killed", "incompetent", "anomalous"):
                 killers.append((tid, st, td))
 
         if not killers:
-            print("No killing test rows found in mutant tests (unexpected for a killed cell).")
+            print("No killer/anomalous test rows found in mutant tests (unexpected for this cell).")
             return
 
-        print(f"\nKILL REASON (up to {MAX_KILLER_TESTS_TO_PRINT} killer tests):")
+        print(f"\nDETAILS (up to {MAX_KILLER_TESTS_TO_PRINT} relevant tests):")
         for tid, st, mtd in killers[:MAX_KILLER_TESTS_TO_PRINT]:
             ptd = program_tests.get(tid) or {}
             pm = clip_msg(ptd.get("raw_short_msg"))
@@ -391,7 +422,7 @@ def main() -> None:
             print(f"  mutant  raw_short_msg: {mm!r}" if mm else "  mutant  raw_short_msg: (null/empty)")
 
         if len(killers) > MAX_KILLER_TESTS_TO_PRINT:
-            print(f"\n(+ {len(killers) - MAX_KILLER_TESTS_TO_PRINT} more killer tests not shown)")
+            print(f"\n(+ {len(killers) - MAX_KILLER_TESTS_TO_PRINT} more relevant tests not shown)")
 
     # ---------- CLICK HANDLER ----------
     def on_click(event):
@@ -429,6 +460,8 @@ def main() -> None:
             cell_label = "killed"
         elif cell_val == INCOMPETENT:
             cell_label = "incompetent"
+        elif cell_val == ANOMALOUS:
+            cell_label = "anomalous"
         else:
             cell_label = f"unknown_val({cell_val})"
 
@@ -468,8 +501,8 @@ def main() -> None:
         # unified diff (original vs reconstructed mutant)
         show_unified_diff(mutant_history, commit, mid)
 
-        # kill reason (tests/messages) for killed/incompetent cells
-        if cell_val in (KILLED, INCOMPETENT):
+        # details for killed/incompetent/anomalous cells
+        if cell_val in (KILLED, INCOMPETENT, ANOMALOUS):
             explain_kill(data, mid)
             return
 
