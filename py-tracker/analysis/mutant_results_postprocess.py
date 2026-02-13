@@ -142,8 +142,8 @@ def compare_and_label(program_test: dict | None, mutant_test: dict, flag_incompe
     if not killed:
         return "survived"
 
-    # NEW: umbrella anomalous classification (only when it would otherwise be "killed")
-    if is_anomalous_message(m_msg):
+    # umbrella anomalous classification (only when it would otherwise be "killed")
+    if killed and (is_anomalous_message(m_msg) or is_anomalous_message(p_msg)):
         return ANOMALOUS_LABEL
 
     # Existing: incompetent
