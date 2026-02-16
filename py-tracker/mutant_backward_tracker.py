@@ -1,10 +1,8 @@
-# mutant_backward_tracker.py
 from __future__ import annotations
 
 import argparse
 import json
 import ast
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any
 from collections import defaultdict
@@ -154,13 +152,38 @@ def get_file_content(commit, path: str) -> str | None:
     return data  # already str
 
 
+def read_commit_list(path: str) -> list[str]:
+    """
+    Read commit hashes from a text file (one per line).
+    Ignores empty lines and lines starting with '#'.
+
+    Expected order: newest -> oldest.
+    The first entry must be the HEAD commit for which mutants were generated.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise SystemExit(f"ERROR: commits file not found: {path}")
+
+    commits: list[str] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        commits.append(s)
+
+    if not commits:
+        raise SystemExit("ERROR: commits file is empty (or only comments/blank lines).")
+
+    return commits
+
+
 # --------------------------------------------------------------------
 # CLI argument parsing
 # --------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Track Python mutants backwards through Git history."
+        description="Track Python mutants backwards through Git history (using an explicit commit list)."
     )
     parser.add_argument(
         "--repo",
@@ -169,35 +192,17 @@ def parse_args() -> argparse.Namespace:
         help="Path to the Git repository root.",
     )
     parser.add_argument(
-        "--branch",
+        "--commits-file",
         type=str,
-        default="HEAD",
-        help="Branch or commit to start from (default: HEAD).",
+        required=True,
+        help="Text file with one commit hash per line (newest -> oldest). First line must be HEAD.",
     )
-
-    # Cutoff selection: either relative (--days) or absolute (--since)
-    cutoff_group = parser.add_mutually_exclusive_group()
-    cutoff_group.add_argument(
-        "--days",
-        type=int,
-        default=365,
-        help="Look back this many days from the branch tip (default: 365).",
-    )
-    cutoff_group.add_argument(
-        "--since",
-        type=str,
-        help=(
-            "Only consider commits after this ISO date/time "
-            "(e.g. '2023-01-01' or '2023-01-01T12:00:00')."
-        ),
-    )
-
     parser.add_argument(
         "--mutant-json",
         type=str,
         nargs="+",
         required=True,
-        help="One or more JSON files containing mutants (same format as mu_utils.json, etc.).",
+        help="One or more JSON files containing mutants (assumed to be for the HEAD commit in commits-file).",
     )
     parser.add_argument(
         "--output",
@@ -224,22 +229,26 @@ def main() -> None:
     repo_path = Path(args.repo)
     repo = Repo(repo_path)
 
-    head_commit = repo.commit(args.branch)
+    # ----------------------------------------------------------------
+    # Load commit list (newest -> oldest)
+    # ----------------------------------------------------------------
+    commit_hexes = read_commit_list(args.commits_file)
+
+    try:
+        commits = [repo.commit(h) for h in commit_hexes]
+    except Exception as e:
+        raise SystemExit(f"ERROR: failed to resolve a commit in {args.commits_file}: {e}")
+
+    head_commit = commits[0]
     head_time = head_commit.committed_datetime
 
-    if args.since:
-        cutoff = datetime.fromisoformat(args.since)
-    else:
-        cutoff = head_time - timedelta(days=args.days)
-
-    print("HEAD:", head_commit.hexsha, head_time)
-    print("Cutoff:", cutoff)
+    print("HEAD (from list):", head_commit.hexsha, head_time)
+    print(f"Total commits in list: {len(commits)} (steps: {max(0, len(commits) - 1)})")
     print("-" * 80)
 
     # ----------------------------------------------------------------
-    # Load mutants (assumed to be for the chosen HEAD/branch)
+    # Load mutants (assumed to be for HEAD in commits-file)
     # ----------------------------------------------------------------
-
     all_mutants: list[Dict[str, Any]] = []
     for json_path in args.mutant_json:
         p = Path(json_path)
@@ -252,7 +261,6 @@ def main() -> None:
     # ----------------------------------------------------------------
     # Per-mutant tracking state
     # ----------------------------------------------------------------
-
     mutant_states: dict[str, dict] = {}  # uid -> state
 
     for m in all_mutants:
@@ -260,7 +268,7 @@ def main() -> None:
         path = m["file"]
         uid = f"{path}#{local_id}"  # global unique id for this mutant
 
-        # Baseline content at HEAD / branch tip
+        # Baseline content at HEAD / list tip
         src_head = get_file_content(head_commit, path)
         if src_head is None:
             mutant_states[uid] = {
@@ -301,7 +309,6 @@ def main() -> None:
     # ----------------------------------------------------------------
     # Initial pruning: drop mutants that are already unparsable at HEAD
     # ----------------------------------------------------------------
-
     initial_dropped = 0
 
     for uid, state in mutant_states.items():
@@ -327,49 +334,20 @@ def main() -> None:
     print(f"Initial pruning: dropped {initial_dropped} mutants that are unparsable at HEAD.")
 
     # ----------------------------------------------------------------
-    # Walk history: HEAD (baseline) → earlier commits
+    # Walk history using the explicit commit list:
+    #   commits[0] (newest/HEAD) -> commits[1] -> ... -> commits[-1] (oldest)
     # ----------------------------------------------------------------
-    #
-    # IMPORTANT PERFORMANCE NOTE (Diff Reuse)
-    # --------------------------------------
-    # For a fixed commit transition (newer -> older) and a fixed file path,
-    # the GumTree AST diff is IDENTICAL for all mutants in that file.
-    #
-    # Therefore, we must NEVER recompute GumTree diffs per mutant.
-    #
-    # Instead, for each commit step we:
-    #   1) group all active mutants by file
-    #   2) detect which files changed between commits
-    #   3) run GumTree diff ONCE per changed file
-    #   4) reuse the resulting AST mapping to translate all mutants in that file
-    #
-    # This reduces the per-step complexity from:
-    #   O(#mutants_in_changed_files × GumTree)
-    # to:
-    #   O(#changed_files × GumTree + #mutants)
-    #
-    # This optimization is crucial for scalability when tracking thousands
-    # of mutants across long Git histories.
-    #
 
-    previous = head_commit  # this is the 'newer' side in each pair
+    previous = head_commit  # newer side
 
-    for i, commit in enumerate(repo.iter_commits(rev=head_commit.hexsha)):  # newest → oldest
-        if i == 0:
-            # first commit produced by iter_commits is HEAD itself
-            continue
-
-        if commit.committed_datetime < cutoff:
-            break
-
+    for older in commits[1:]:
         # determine which mutants are still active before doing any work
         active_uids = [uid for uid, st in mutant_states.items() if st["active"]]
         if not active_uids:
             print("\nNo more active mutants to propagate; stopping history walk.")
             break
 
-        older = commit      # older commit
-        newer = previous    # newer commit
+        newer = previous  # newer commit in this transition
 
         print("\n===========================================================")
         print(f"Mapping from newer {newer.hexsha} -> older {older.hexsha}")
@@ -379,13 +357,6 @@ def main() -> None:
         # ----------------------------------------------------------------
         # Group active mutants by file
         # ----------------------------------------------------------------
-        #
-        # Mutants are grouped by their source file so that:
-        #   - unchanged files can propagate all mutants trivially
-        #   - changed files require exactly ONE GumTree diff per file
-        #
-        # This grouping is the key enabler for diff reuse.
-        #
         active_by_file: dict[str, list[str]] = defaultdict(list)
         for uid in active_uids:
             active_by_file[mutant_states[uid]["file"]].append(uid)
@@ -398,20 +369,17 @@ def main() -> None:
         src_older_cache: dict[str, str | None] = {}
 
         for path in active_files:
-            prev_blob = get_blob(newer, path)
+            newer_blob = get_blob(newer, path)
             older_blob = get_blob(older, path)
 
-            if prev_blob is None or older_blob is None:
+            if newer_blob is None or older_blob is None:
                 # treat as "changed" so tracking can fail appropriately
                 file_changed[path] = True
                 src_newer_cache[path] = get_file_content(newer, path)
                 src_older_cache[path] = get_file_content(older, path)
                 continue
 
-            if prev_blob.hexsha == older_blob.hexsha:
-                file_changed[path] = False
-            else:
-                file_changed[path] = True
+            file_changed[path] = (newer_blob.hexsha != older_blob.hexsha)
 
             # cache content in both cases
             src_newer_cache[path] = get_file_content(newer, path)
@@ -420,30 +388,11 @@ def main() -> None:
         # ----------------------------------------------------------------
         # Diff cache (per commit step)
         # ----------------------------------------------------------------
-        #
-        # diff_cache[path] stores the AST mapping produced by GumTree
-        # for the transition:
-        #     newer_commit:file  ->  older_commit:file
-        #
-        # The mapping is a dictionary keyed by:
-        #     "src_start_pos-src_end_pos"   (inclusive end)
-        #
-        # IMPORTANT:
-        #   - GumTree is invoked AT MOST ONCE per (commit, file) pair
-        #   - All mutants in the same file reuse this cached mapping
-        #
         diff_cache: dict[str, dict | None] = {}
 
         # ----------------------------------------------------------------
         # Compute GumTree diff ONCE per changed file
         # ----------------------------------------------------------------
-        #
-        # GumTree is expensive (Docker startup + AST matching).
-        # We therefore compute the diff only once per file and cache it.
-        #
-        # If the diff fails for a file, all mutants in that file will
-        # stop propagating at this commit with reason="no_mapping".
-        #
         for path in active_files:
             if not file_changed.get(path, True):
                 continue
@@ -469,7 +418,7 @@ def main() -> None:
             src_newer = src_newer_cache.get(path)
             src_older = src_older_cache.get(path)
 
-            # If file is missing in either commit: stop tracking this mutant (no reason tracked)
+            # If file is missing in either commit: stop tracking this mutant
             if src_newer is None or src_older is None:
                 for uid in uids_in_file:
                     deactivate_mutant(mutant_states[uid], reason=None)
@@ -511,19 +460,6 @@ def main() -> None:
                     "mutant_value": info["mutant_value"],
                 }
 
-                # --------------------------------------------------------
-                # Fast mutant mapping using cached AST diff
-                # --------------------------------------------------------
-                #
-                # At this point:
-                #   - GumTree has already been executed for this file
-                #   - `mapping` contains the full src→dst node correspondence
-                #
-                # Mapping a mutant now reduces to:
-                #   1) lookup its source node range in the mapping
-                #   2) apply the mutant_value at the mapped destination range
-                #
-                #
                 mapped_mutant, new_start_pos, new_end_pos = map_mutant_with_diff(
                     src_to=src_older,
                     mu_info_from=mu_step,
@@ -571,7 +507,7 @@ def main() -> None:
     print(f"\nTracked {tracked} mutants with at least one commit.")
 
     reason_counts: dict[str, int] = {}
-    for uid, state in mutant_states.items():
+    for state in mutant_states.values():
         reason = state.get("death_reason")
         if reason:
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
