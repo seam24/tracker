@@ -146,6 +146,11 @@ def compare_and_label(program_test: dict | None, mutant_test: dict, flag_incompe
     if is_anomalous_message(m_msg):
         return ANOMALOUS_LABEL
 
+
+    # umbrella anomalous classification (only when it would otherwise be "killed")
+    # if killed and (is_anomalous_message(m_msg) or is_anomalous_message(p_msg)): return ANOMALOUS_LABEL
+    
+
     # Existing: incompetent
     if flag_incompetent:
         m0 = (m_msg or "").lstrip()
