@@ -66,8 +66,13 @@ def mutant_status_from_tests(mtests: Dict[str, Any]) -> str:
         return "killed"
     if any(s == "anomalous" for s in statuses):
         return "anomalous"
-    if all(s == "survived" for s in statuses):
+    
+    # if all(s == "survived" for s in statuses):
+    #     return "survived"
+    
+    if all(s in ("survived", "unknown") for s in statuses) and any(s == "survived" for s in statuses):
         return "survived"
+        
     return "unknown"
 
 
