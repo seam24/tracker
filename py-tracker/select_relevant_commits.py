@@ -248,7 +248,6 @@ def parse_name_status(repo: Repo, parent_hexsha: str, commit_hexsha: str) -> Lis
         parts = line.split("\t")
         status_raw = parts[0]
 
-        # Rename, e.g. R100
         if status_raw.startswith("R") and len(parts) >= 3:
             entries.append({
                 "status": "R",
@@ -299,10 +298,6 @@ def changed_paths_in_commit(repo: Repo, commit) -> Set[str]:
 
 
 def classify_diff_entries(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Splits diff entries into source code vs tests.
-    Here we treat Python files as relevant. You can expand this if needed.
-    """
     source = {
         "added": [],
         "modified": [],
@@ -330,8 +325,6 @@ def classify_diff_entries(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
             old_bucket = bucket_for(old_path)
             new_bucket = bucket_for(new_path)
 
-            # If either side is test, mark as test evolution.
-            # Otherwise mark as source evolution.
             if old_bucket is tests or new_bucket is tests:
                 tests["renamed"].append({"old": old_path, "new": new_path})
             elif old_bucket is source or new_bucket is source:
@@ -377,7 +370,7 @@ def evolution_info_for_commit(repo: Repo, commit) -> Dict[str, Any]:
 
 
 # ============================================================
-# Relevance logic
+# Relevance logic (original dynamic mode)
 # ============================================================
 
 def is_relevant_commit(repo: Repo, commit, targets: Set[str]) -> bool:
@@ -387,7 +380,147 @@ def is_relevant_commit(repo: Repo, commit, targets: Set[str]) -> bool:
 
 
 # ============================================================
-# Collector
+# Relevance logic (new explicit-path mode with rename tracking)
+# ============================================================
+
+def commit_touches_watched_paths(repo: Repo, commit, watched_paths: Set[str]) -> bool:
+    """
+    True iff this commit touches any currently watched path.
+    watched_paths are interpreted in the namespace of `commit` itself
+    (the newer side when walking from HEAD backwards).
+    """
+    if not commit.parents:
+        touched = set(list_files(repo, commit.hexsha))
+        return bool(touched & watched_paths)
+
+    parent = commit.parents[0]
+    entries = parse_name_status(repo, parent.hexsha, commit.hexsha)
+
+    for e in entries:
+        old_path = e["old_path"]
+        new_path = e["new_path"]
+        if (old_path and old_path in watched_paths) or (new_path and new_path in watched_paths):
+            return True
+
+    return False
+
+
+def rewind_watched_paths_through_commit(repo: Repo, commit, watched_paths: Set[str]) -> Set[str]:
+    """
+    Move watched paths one step backward in history:
+    commit namespace  --->  parent namespace
+
+    If a watched file was renamed in this commit from old -> new,
+    and we are traversing backward, then we must replace new by old.
+    """
+    if not commit.parents:
+        return set(watched_paths)
+
+    parent = commit.parents[0]
+    entries = parse_name_status(repo, parent.hexsha, commit.hexsha)
+
+    out = set(watched_paths)
+
+    for e in entries:
+        if e["status"] != "R":
+            continue
+
+        old_path = e["old_path"]
+        new_path = e["new_path"]
+
+        if new_path in out:
+            out.remove(new_path)
+            out.add(old_path)
+
+    return out
+
+
+def collect_commits_for_explicit_paths(
+    repo_or_path,
+    watched_paths: Set[str],
+    *,
+    max_commits: int = 100,
+    start_commit: Optional[str] = None,
+    days: Optional[int] = None,
+    include_head: bool = True,
+    include_boundary: bool = True,
+    step_log_every: int = 25,
+):
+    """
+    Collect commits from HEAD backwards where one of the explicitly provided
+    watched paths is changed. Renames are followed backward, so if utils.py
+    used to live somewhere else, older commits still match that old location.
+
+    `watched_paths` should usually be given as HEAD-era paths.
+    """
+    repo = repo_or_path if isinstance(repo_or_path, Repo) else Repo(repo_or_path)
+
+    if start_commit is not None and days is not None:
+        raise ValueError("Use either start_commit or days, not both.")
+
+    cutoff = None
+    if days is not None:
+        cutoff = repo.head.commit.committed_datetime - timedelta(days=days)
+
+    kept = []
+    scanned = 0
+    relevant_count = 0
+    anchor_count = 0
+    watched_now = set(watched_paths)
+
+    log(
+        f"collect_commits_for_explicit_paths: "
+        f"max_commits={max_commits}, start_commit={start_commit}, days={days}, "
+        f"include_head={include_head}, include_boundary={include_boundary}, "
+        f"initial_watched={sorted(watched_now)}"
+    )
+
+    for c in repo.iter_commits("HEAD", first_parent=True):
+        scanned += 1
+        boundary_hit = bool(start_commit and c.hexsha.startswith(start_commit))
+
+        if cutoff is not None and c.committed_datetime < cutoff:
+            log(f"cutoff reached after scanning {scanned} commits")
+            break
+
+        if scanned == 1 and include_head:
+            kept.append(c)
+            anchor_count += 1
+        else:
+            hit = commit_touches_watched_paths(repo, c, watched_now)
+
+            if hit:
+                kept.append(c)
+                relevant_count += 1
+            elif boundary_hit and include_boundary:
+                kept.append(c)
+                anchor_count += 1
+
+            if step_log_every and scanned % step_log_every == 0:
+                log(
+                    f"[{scanned}] relevant={hit} boundary={boundary_hit} "
+                    f"kept={len(kept)} relevant_count={relevant_count} "
+                    f"anchors={anchor_count} watched={sorted(watched_now)}"
+                )
+
+        if len(kept) >= max_commits:
+            break
+
+        if boundary_hit:
+            break
+
+        watched_now = rewind_watched_paths_through_commit(repo, c, watched_now)
+
+    log(
+        f"collect_commits_for_explicit_paths: done scanned={scanned} "
+        f"kept={len(kept)} relevant_count={relevant_count} anchors={anchor_count} "
+        f"final_watched={sorted(watched_now)}"
+    )
+    return kept
+
+
+# ============================================================
+# Collector (original dynamic mode)
 # ============================================================
 
 def collect_relevant_commits(
@@ -498,16 +631,17 @@ def save_commit_evolution_jsonl(path: str, repo: Repo, commits) -> None:
 
 if __name__ == "__main__":
     prj_name = "youtube-dl"
-    bug_id = "41"
+    bug_id = "43"
     repo_path = f"../../chk/{prj_name}-{bug_id}b/{prj_name}"
 
+    repo = Repo(repo_path)
+
+    # dynamic one-hop neighbours mode
     targets = {
         "youtube_dl/utils.py",
     }
 
-    repo = Repo(repo_path)
-
-    kept = collect_relevant_commits(
+    kept_dynamic = collect_relevant_commits(
         repo,
         targets,
         max_commits=25,
@@ -516,10 +650,28 @@ if __name__ == "__main__":
         step_log_every=10,
     )
 
-    save_commits_to_run("commits_to_run.txt", kept)
-    save_commit_evolution_json("commit_evolution.json", repo, kept)
-    # or:
-    # save_commit_evolution_jsonl("commit_evolution.jsonl", repo, kept)
+    save_commits_to_run("commits_to_run_dynamic.txt", kept_dynamic)
+    save_commit_evolution_json("commit_evolution_dynamic.json", repo, kept_dynamic)
 
-    log(f"saved {len(kept)} commits to commits_to_run.txt")
-    log("saved evolution metadata to commit_evolution.json")
+    # static explicit-path mode
+    # watched_paths = {
+    #     "youtube_dl/utils.py",
+    #     "test/test_utils.py",
+    #     # "youtube_dl/compat.py",
+    #     # "test/test_compat.py",
+    # }
+
+    # kept_explicit = collect_commits_for_explicit_paths(
+    #     repo,
+    #     watched_paths,
+    #     max_commits=100,
+    #     include_head=True,
+    #     include_boundary=False,
+    #     step_log_every=10,
+    # )
+
+    # save_commits_to_run(f"commits_to_run.txt", kept_explicit)
+    # save_commit_evolution_json(f"commit_evolution.json", repo, kept_explicit)
+
+    # log(f"saved {len(kept_explicit)} commits to commits_to_run.txt")
+    # log(f"saved evolution metadata to commit_evolution.json")
