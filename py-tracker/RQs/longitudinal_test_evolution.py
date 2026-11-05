@@ -15,10 +15,10 @@ WITH_LBL_DIR = BASE / "with_lbl"
 COMMITS_PATH = BASE / "commits_to_run.txt"
 MUTANT_HISTORY_PATH = BASE / "mutant_history.json"
 
-REPO_DIR = Path(f"C://Users//tahar//Desktop//shared//LatentMu//commits2//{pid}-{bid}b/{pid}")
+REPO_DIR = Path(f"commits2 path here/{pid}-{bid}b/{pid}")
 OUT_JSON = Path(f"D://res") / f"{pid}-{bid}b_buggy_commit_analysis.json"
 
-BUGSINPY=Path(f"C:\\Users\\tahar\\Desktop\\shared\\LatentMu\\BugsInPy2\\BugsInPy\\projects\\{pid}\\bugs\\{bid}")
+BUGSINPY=Path(f"BUGSINPY projects path here/{pid}/bugs/{bid}")
 
 REQUIRE_PROGRAM_EXITSTATUS_0_OR_1 = True
 SAVE_FULL_JSON = False

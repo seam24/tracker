@@ -1,0 +1,500 @@
+{
+  "black-10b": {
+    "fix_files": [
+      "blib2to3/pgen2/driver.py"
+    ],
+    "r1": [
+      "blib2to3/pgen2/driver.py::Driver._partially_consume_prefix"
+    ],
+    "n_r2": 2,
+    "n_neighbor_files": 7
+  },
+  "black-11b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::should_explode",
+      "black.py::split_line"
+    ],
+    "n_r2": 5,
+    "n_neighbor_files": 6
+  },
+  "black-12b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::BracketTracker.maybe_decrement_after_for_loop_variable",
+      "black.py::BracketTracker.maybe_decrement_after_lambda_arguments",
+      "black.py::BracketTracker.maybe_increment_for_loop_variable",
+      "black.py::BracketTracker.maybe_increment_lambda_arguments"
+    ],
+    "n_r2": 3,
+    "n_neighbor_files": 5
+  },
+  "black-13b": {
+    "fix_files": [
+      "blib2to3/pgen2/tokenize.py"
+    ],
+    "r1": [
+      "blib2to3/pgen2/tokenize.py::generate_tokens"
+    ],
+    "n_r2": 9,
+    "n_neighbor_files": 3
+  },
+  "black-14b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::get_future_imports"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 5
+  },
+  "black-15b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::DebugVisitor.show",
+      "black.py::EmptyLineTracker.maybe_empty_lines",
+      "black.py::FormatError.__init__",
+      "black.py::FormatError.leaf_from_consumed",
+      "black.py::FormatError.trim_prefix",
+      "black.py::LineGenerator.line",
+      "black.py::LineGenerator.visit",
+      "black.py::LineGenerator.visit_default",
+      "black.py::LineGenerator.visit_unformatted",
+      "black.py::UnformattedLines.__str__",
+      "black.py::UnformattedLines.append",
+      "black.py::UnformattedLines.append_comment",
+      "black.py::UnformattedLines.maybe_increment_for_loop_variable",
+      "black.py::UnformattedLines.maybe_remove_trailing_comma",
+      "black.py::container_of",
+      "black.py::generate_comments",
+      "black.py::generate_ignored_nodes",
+      "black.py::hide_fmt_off",
+      "black.py::normalize_fmt_off",
+      "black.py::split_line"
+    ],
+    "n_r2": 56,
+    "n_neighbor_files": 5
+  },
+  "black-16b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::gen_python_files_in_dir"
+    ],
+    "n_r2": 2,
+    "n_neighbor_files": 5
+  },
+  "black-3b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::main"
+    ],
+    "n_r2": 11,
+    "n_neighbor_files": 7
+  },
+  "black-4b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::EmptyLineTracker.maybe_empty_lines"
+    ],
+    "n_r2": 2,
+    "n_neighbor_files": 7
+  },
+  "black-7b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::normalize_invisible_parens"
+    ],
+    "n_r2": 10,
+    "n_neighbor_files": 7
+  },
+  "black-8b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::bracket_split_build_line"
+    ],
+    "n_r2": 7,
+    "n_neighbor_files": 7
+  },
+  "black-9b": {
+    "fix_files": [
+      "black.py"
+    ],
+    "r1": [
+      "black.py::get_grammars"
+    ],
+    "n_r2": 2,
+    "n_neighbor_files": 7
+  },
+  "cookiecutter-2b": {
+    "fix_files": [
+      "cookiecutter/hooks.py"
+    ],
+    "r1": [
+      "cookiecutter/hooks.py::find_hook",
+      "cookiecutter/hooks.py::run_hook"
+    ],
+    "n_r2": 3,
+    "n_neighbor_files": 4
+  },
+  "fastapi-4b": {
+    "fix_files": [
+      "fastapi/openapi/utils.py"
+    ],
+    "r1": [
+      "fastapi/openapi/utils.py::get_openapi_path"
+    ],
+    "n_r2": 10,
+    "n_neighbor_files": 10
+  },
+  "fastapi-5b": {
+    "fix_files": [
+      "fastapi/utils.py"
+    ],
+    "r1": [
+      "fastapi/utils.py::create_cloned_field"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 8
+  },
+  "fastapi-6b": {
+    "fix_files": [
+      "fastapi/dependencies/utils.py"
+    ],
+    "r1": [
+      "fastapi/dependencies/utils.py::request_body_to_args"
+    ],
+    "n_r2": 6,
+    "n_neighbor_files": 9
+  },
+  "fastapi-8b": {
+    "fix_files": [
+      "fastapi/routing.py"
+    ],
+    "r1": [
+      "fastapi/routing.py::APIRouter.add_api_route",
+      "fastapi/routing.py::APIRouter.include_router"
+    ],
+    "n_r2": 5,
+    "n_neighbor_files": 9
+  },
+  "fastapi-9b": {
+    "fix_files": [
+      "fastapi/dependencies/utils.py"
+    ],
+    "r1": [
+      "fastapi/dependencies/utils.py::get_body_field"
+    ],
+    "n_r2": 3,
+    "n_neighbor_files": 8
+  },
+  "thefuck-10b": {
+    "fix_files": [
+      "thefuck/rules/man.py"
+    ],
+    "r1": [
+      "thefuck/rules/man.py::get_new_command"
+    ],
+    "n_r2": 0,
+    "n_neighbor_files": 1
+  },
+  "thefuck-12b": {
+    "fix_files": [
+      "thefuck/rules/no_command.py"
+    ],
+    "r1": [
+      "thefuck/rules/no_command.py::match"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 2
+  },
+  "thefuck-13b": {
+    "fix_files": [
+      "thefuck/rules/git_branch_exists.py"
+    ],
+    "r1": [
+      "thefuck/rules/git_branch_exists.py::get_new_command",
+      "thefuck/rules/git_branch_exists.py::match"
+    ],
+    "n_r2": 3,
+    "n_neighbor_files": 3
+  },
+  "thefuck-14b": {
+    "fix_files": [
+      "thefuck/shells/fish.py"
+    ],
+    "r1": [
+      "thefuck/shells/fish.py::Fish._get_overridden_aliases"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 3
+  },
+  "thefuck-15b": {
+    "fix_files": [
+      "thefuck/rules/git_add.py"
+    ],
+    "r1": [
+      "thefuck/rules/git_add.py::get_new_command",
+      "thefuck/rules/git_add.py::match"
+    ],
+    "n_r2": 3,
+    "n_neighbor_files": 2
+  },
+  "thefuck-17b": {
+    "fix_files": [
+      "thefuck/shells/bash.py",
+      "thefuck/shells/zsh.py"
+    ],
+    "r1": [
+      "thefuck/shells/bash.py::Bash.app_alias",
+      "thefuck/shells/bash.py::Bash.get_aliases",
+      "thefuck/shells/zsh.py::Zsh.get_aliases"
+    ],
+    "n_r2": 5,
+    "n_neighbor_files": 4
+  },
+  "thefuck-18b": {
+    "fix_files": [
+      "thefuck/rules/sudo.py"
+    ],
+    "r1": [
+      "thefuck/rules/sudo.py::match"
+    ],
+    "n_r2": 0,
+    "n_neighbor_files": 0
+  },
+  "thefuck-19b": {
+    "fix_files": [
+      "thefuck/rules/git_push_force.py"
+    ],
+    "r1": [
+      "thefuck/rules/git_push_force.py::get_new_command"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 2
+  },
+  "thefuck-20b": {
+    "fix_files": [
+      "thefuck/rules/dirty_unzip.py"
+    ],
+    "r1": [
+      "thefuck/rules/dirty_unzip.py::_zip_file",
+      "thefuck/rules/dirty_unzip.py::get_new_command"
+    ],
+    "n_r2": 2,
+    "n_neighbor_files": 1
+  },
+  "thefuck-21b": {
+    "fix_files": [
+      "thefuck/rules/git_fix_stash.py"
+    ],
+    "r1": [
+      "thefuck/rules/git_fix_stash.py::match"
+    ],
+    "n_r2": 0,
+    "n_neighbor_files": 2
+  },
+  "thefuck-25b": {
+    "fix_files": [
+      "thefuck/rules/mkdir_p.py"
+    ],
+    "r1": [
+      "thefuck/rules/mkdir_p.py::get_new_command"
+    ],
+    "n_r2": 0,
+    "n_neighbor_files": 1
+  },
+  "thefuck-26b": {
+    "fix_files": [
+      "thefuck/rules/vagrant_up.py"
+    ],
+    "r1": [
+      "thefuck/rules/vagrant_up.py::get_new_command"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 1
+  },
+  "thefuck-27b": {
+    "fix_files": [
+      "thefuck/rules/open.py"
+    ],
+    "r1": [
+      "thefuck/rules/open.py::get_new_command"
+    ],
+    "n_r2": 0,
+    "n_neighbor_files": 0
+  },
+  "thefuck-28b": {
+    "fix_files": [
+      "thefuck/rules/fix_file.py"
+    ],
+    "r1": [
+      "thefuck/rules/fix_file.py::get_new_command"
+    ],
+    "n_r2": 2,
+    "n_neighbor_files": 2
+  },
+  "thefuck-30b": {
+    "fix_files": [
+      "thefuck/rules/fix_file.py"
+    ],
+    "r1": [
+      "thefuck/rules/fix_file.py::match"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 2
+  },
+  "thefuck-31b": {
+    "fix_files": [
+      "thefuck/rules/git_diff_staged.py"
+    ],
+    "r1": [
+      "thefuck/rules/git_diff_staged.py::get_new_command"
+    ],
+    "n_r2": 0,
+    "n_neighbor_files": 1
+  },
+  "thefuck-3b": {
+    "fix_files": [
+      "thefuck/shells/fish.py"
+    ],
+    "r1": [
+      "thefuck/shells/fish.py::Fish.info"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 5
+  },
+  "thefuck-4b": {
+    "fix_files": [
+      "thefuck/shells/fish.py"
+    ],
+    "r1": [
+      "thefuck/shells/fish.py::_get_aliases"
+    ],
+    "n_r2": 2,
+    "n_neighbor_files": 5
+  },
+  "thefuck-5b": {
+    "fix_files": [
+      "thefuck/rules/git_push.py"
+    ],
+    "r1": [
+      "thefuck/rules/git_push.py::match"
+    ],
+    "n_r2": 0,
+    "n_neighbor_files": 2
+  },
+  "thefuck-6b": {
+    "fix_files": [
+      "thefuck/rules/git_branch_exists.py"
+    ],
+    "r1": [
+      "thefuck/rules/git_branch_exists.py::get_new_command",
+      "thefuck/rules/git_branch_exists.py::match"
+    ],
+    "n_r2": 3,
+    "n_neighbor_files": 3
+  },
+  "thefuck-8b": {
+    "fix_files": [
+      "thefuck/rules/dnf_no_such_command.py"
+    ],
+    "r1": [
+      "thefuck/rules/dnf_no_such_command.py::_get_operations",
+      "thefuck/rules/dnf_no_such_command.py::_parse_operations"
+    ],
+    "n_r2": 1,
+    "n_neighbor_files": 3
+  },
+  "tqdm-5b": {
+    "fix_files": [
+      "tqdm/_tqdm.py"
+    ],
+    "r1": [
+      "tqdm/_tqdm.py::tqdm.__init__"
+    ],
+    "n_r2": 8,
+    "n_neighbor_files": 7
+  },
+  "tqdm-7b": {
+    "fix_files": [
+      "tqdm/_main.py"
+    ],
+    "r1": [],
+    "n_r2": 0,
+    "n_neighbor_files": 4
+  },
+  "tqdm-8b": {
+    "fix_files": [
+      "tqdm/_tqdm.py"
+    ],
+    "r1": [
+      "tqdm/_tqdm.py::tqdm.format_meter"
+    ],
+    "n_r2": 9,
+    "n_neighbor_files": 4
+  },
+  "tqdm-9b": {
+    "fix_files": [
+      "tqdm/_tqdm.py"
+    ],
+    "r1": [
+      "tqdm/_tqdm.py::format_sizeof",
+      "tqdm/_tqdm.py::tqdm.__init__",
+      "tqdm/_tqdm.py::tqdm.__iter__",
+      "tqdm/_tqdm.py::tqdm.__len__"
+    ],
+    "n_r2": 6,
+    "n_neighbor_files": 2
+  },
+  "youtube-dl-10b": {
+    "fix_files": [
+      "youtube_dl/utils.py"
+    ],
+    "r1": [
+      "youtube_dl/utils.py::js_to_json"
+    ],
+    "n_r2": 7,
+    "n_neighbor_files": 346
+  },
+  "youtube-dl-31b": {
+    "fix_files": [
+      "youtube_dl/extractor/minhateca.py",
+      "youtube_dl/utils.py"
+    ],
+    "r1": [
+      "youtube_dl/extractor/minhateca.py::MinhatecaIE._real_extract",
+      "youtube_dl/utils.py::parse_duration"
+    ],
+    "n_r2": 51,
+    "n_neighbor_files": 319
+  },
+  "youtube-dl-32b": {
+    "fix_files": [
+      "youtube_dl/extractor/npo.py",
+      "youtube_dl/utils.py"
+    ],
+    "r1": [
+      "youtube_dl/extractor/npo.py::NPOIE._get_info",
+      "youtube_dl/utils.py::strip_jsonp"
+    ],
+    "n_r2": 12,
+    "n_neighbor_files": 314
+  }
+}

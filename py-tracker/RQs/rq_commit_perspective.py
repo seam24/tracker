@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 pid = "tqdm"
 
 DATA_ROOT = Path("D://data_from_hpc")
-REPO_ROOT = Path("C://Users//tahar//Desktop//shared//LatentMu//commits2")
+REPO_ROOT = Path("commits2 path here")
 
 REQUIRE_PROGRAM_EXITSTATUS_0_OR_1 = True
 REMOVE_UNINFORMATIVE_COMMITS = True

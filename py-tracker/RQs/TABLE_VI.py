@@ -11,10 +11,9 @@ from statistics import median
 # ============================================================
 DATA_ROOT = Path("D:/data_from_hpc")
 
-# Expected repo path:
-# C:/Users/tahar/Desktop/shared/LatentMu/commits2/black-16b/black
+# Expected repo path: commits2 path here/{instance}/{pid}
 REPO_ROOT_TEMPLATE = Path(
-    "C:/Users/tahar/Desktop/shared/LatentMu/commits2/{instance}/{pid}"
+    "commits2 path here/{instance}/{pid}"
 )
 
 OUT_DIR = Path("D:/res/rq3_commit_pair_context")

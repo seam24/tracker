@@ -544,9 +544,9 @@ def analyze_bid(project_id, bug_id):
     WITH_LBL_DIR = BASE / "with_lbl"
     COMMITS_PATH = BASE / "commits_to_run.txt"
     MUTANT_HISTORY_PATH = BASE / "mutant_history.json"
-    REPO_DIR = Path(f"C:/Users/tahar/Desktop/shared/LatentMu/commits2/{project_id}-{bug_id}b/{project_id}")
+    REPO_DIR = Path(f"commits2 path here/{project_id}-{bug_id}b/{project_id}")
     BUGSINPY = Path(
-        f"C:/Users/tahar/Desktop/shared/LatentMu/BugsInPy2/BugsInPy/projects/{project_id}/bugs/{bug_id}"
+        f"BUGSINPY projects path here/{project_id}/bugs/{bug_id}"
     )
 
     metadata = load_bug_metadata()

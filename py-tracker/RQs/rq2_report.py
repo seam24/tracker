@@ -15,13 +15,9 @@ import numpy as np
 RES_DIR = Path("D://res")
 PATTERN = "*_rq1.json"
 
-BUGSINPY_ROOT = Path(
-    r"C:\Users\tahar\Desktop\shared\LatentMu\BugsInPy2\BugsInPy\projects"
-)
+BUGSINPY_ROOT = Path("BUGSINPY projects path here")
 
-COMMITS_ROOT = Path(
-    r"C:\Users\tahar\Desktop\shared\LatentMu\commits2"
-)
+COMMITS_ROOT = Path("commits2 path here")
 
 REGIONS = [
     "r1_faulty",
